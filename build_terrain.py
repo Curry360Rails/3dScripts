@@ -25,7 +25,7 @@ from shapely import from_wkb
 from shapely.geometry import shape
 
 
-def load_lines(path, layers, target_crs):
+def load_lines(path, layers, target_crs, preserve_original_crs=False):
     import pyogrio
     available = pyogrio.list_layers(path)[:, 0].tolist()
     selected = layers or available
@@ -35,8 +35,18 @@ def load_lines(path, layers, target_crs):
     for layer in tqdm(selected, desc="Reading GPKG layers", unit="layer"):
         info = pyogrio.read_info(path, layer=layer)
         source_crs = info.get('crs')
-        if not source_crs:
-            raise ValueError(f"Layer {layer!r} has no stored CRS; assign its verified CRS before proceeding")
+
+if not source_crs:
+    if preserve_original_crs:
+        print(
+            f"WARNING: Layer {layer!r} has no stored CRS. "
+            "Preserving original coordinates without reprojection."
+        )
+    else:
+        raise ValueError(
+            f"Layer {layer!r} has no stored CRS. "
+            "Cannot safely reproject geometry."
+        )
         from pyogrio.raw import read as read_raw
         _, _, wkbs, _ = read_raw(path, layer=layer, columns=[], read_geometry=True)
         for wkb in wkbs:
@@ -45,7 +55,22 @@ def load_lines(path, layers, target_crs):
             geom = from_wkb(wkb)
             if geom.is_empty:
                 continue
-            projected = shape(transform_geom(source_crs, target_crs, geom.__geo_interface__))
+            # Avoid unnecessary coordinate transformation for matching CRS.
+            same_crs = rasterio.crs.CRS.from_user_input(source_crs) == rasterio.crs.CRS.from_user_input(target_crs)
+            if preserve_original_crs and not same_crs:
+                raise ValueError(f"Exact-vertex export requires matching CRS: {source_crs} != {target_crs}")
+                if preserve_original_crs:
+                    projected = geom
+                else:
+                    projected = geom if same_crs else shape(transform_geom(source_crs, target_crs, geom.__geo_interface__))
+                    #projected = shape(
+                    #    transform_geom(
+                    #        source_crs,
+                    #        target_crs,
+                    #        geom.__geo_interface__
+                    #    )
+                    #)
+            
             if projected.geom_type == 'LineString':
                 geometries.append(projected)
             elif projected.geom_type == 'MultiLineString':
@@ -57,7 +82,7 @@ def load_lines(path, layers, target_crs):
     return geometries, selected
 
 
-def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offset, preserve_z):
+def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offset, preserve_z, exact_vertices=False):
     path = out / 'network_lines.obj'
     idx = 1
     count = 0
@@ -68,12 +93,17 @@ def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offs
             raw = list(geom.coords)
             if len(raw) < 2:
                 continue
-            pts = [raw[0]]
-            for a, b in zip(raw, raw[1:]):
-                steps = max(1, math.ceil(math.hypot(b[0]-a[0], b[1]-a[1]) / spacing))
-                for j in range(1, steps+1):
-                    t = j/steps
-                    pts.append(tuple(a[k]+t*(b[k]-a[k]) for k in range(min(len(a),len(b)))))
+            if exact_vertices:
+                if not geom.has_z:
+                    raise ValueError("Exact-vertex network export requires 3D GPKG polylines")
+                pts = raw
+            else:
+                pts = [raw[0]]
+                for a, b in zip(raw, raw[1:]):
+                    steps = max(1, math.ceil(math.hypot(b[0]-a[0], b[1]-a[1]) / spacing))
+                    for j in range(1, steps+1):
+                        t = j/steps
+                        pts.append(tuple(a[k]+t*(b[k]-a[k]) for k in range(min(len(a),len(b)))))
             has_z = preserve_z and geom.has_z
             samples = None if has_z else dem.sample([(p[0],p[1]) for p in pts], indexes=1, masked=True)
             chain = []
@@ -83,7 +113,8 @@ def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offs
                     if len(chain)>1: obj.write('l '+' '.join(map(str,chain))+'\n')
                     chain=[]
                     continue
-                obj.write(f'v {p[0]-origin_x:.5f} {p[1]-origin_y:.5f} {float(z)-base+z_offset:.5f}\n')
+                precision = 12 if exact_vertices else 5
+                obj.write(f'v {p[0]-origin_x:.{precision}f} {p[1]-origin_y:.{precision}f} {float(z)-base+z_offset:.{precision}f}\n')
                 chain.append(idx); idx+=1; count+=1
             if len(chain)>1:
                 obj.write('l '+' '.join(map(str,chain))+'\n')
@@ -359,7 +390,7 @@ def main():
             raise ValueError('DEM must use a projected CRS in meters')
         b = dem.bounds
         if args.network_only:
-            lines, layers = load_lines(args.gpkg, args.layer, dem.crs)
+            lines, layers = load_lines(args.gpkg, args.layer, dem.crs, preserve_original_crs=True)
             # Match the normal terrain export origin and baseline without generating a mesh.
             # Rasterio's masked minimum excludes NoData pixels.
             if args.base_elevation is not None:
@@ -374,13 +405,16 @@ def main():
                 if minimum is None:
                     raise ValueError('DEM contains no valid elevations')
                 base = minimum
+            if args.use_dem_line_z:
+                raise ValueError("--use-dem-line-z is incompatible with --network-only exact vertices")
             export_lines(lines, dem, out, b.left, b.bottom, base,
-                         args.line_spacing, args.line_z_offset, not args.use_dem_line_z)
+                         args.line_spacing, 0.0, True, exact_vertices=True)
             (out / 'georeference.json').write_text(json.dumps({
                 'crs': str(dem.crs), 'origin_x': b.left, 'origin_y': b.bottom,
                 'base_elevation': base, 'layers': layers,
                 'existing_line_z_preserved': not args.use_dem_line_z,
-                'network_only': True
+                'network_only': True, 'exact_gpkg_vertices': True,
+                'vertex_count_modified': False, 'line_z_offset': 0.0
             }, indent=2), encoding='utf-8')
             print(f'Done: network-only export at {out.resolve()}', flush=True)
             return
