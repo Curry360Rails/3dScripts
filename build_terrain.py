@@ -15,7 +15,9 @@ from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
 from rasterio.warp import reproject, transform_geom
 
-from shapely.geometry import LineString, MultiLineString, GeometryCollection
+from shapely.geometry import LineString, MultiLineString, GeometryCollection, box, Polygon
+from shapely.ops import unary_union
+from shapely import constrained_delaunay_triangles
 from shapely import from_wkb
 from shapely.geometry import shape
 
@@ -32,9 +34,9 @@ def load_lines(path, layers, target_crs):
         source_crs = info.get('crs')
         if not source_crs:
             raise ValueError(f"Layer {layer!r} has no stored CRS; assign its verified CRS before proceeding")
-        meta, table = pyogrio.read_arrow(path, layer=layer, columns=[], read_geometry=True)
-        geometry_column = meta['geometry_name']
-        for wkb in table[geometry_column].to_pylist():
+        from pyogrio.raw import read as read_raw
+        _, _, wkbs, _ = read_raw(path, layer=layer, columns=[], read_geometry=True)
+        for wkb in wkbs:
             if wkb is None:
                 continue
             geom = from_wkb(wkb)
@@ -92,7 +94,7 @@ def read_corridors(path, layers, target_crs):
     return STRtree(geometries), selected, geometries
 
 
-def build_cells(bounds, tree, near, middle, far, buffer, transition, max_cells):
+def build_cells(bounds, tree, near, middle, far, buffer, transition, max_cells, corridor_only=False, corridor_radius=100):
     from shapely.geometry import box
     x0, y0, x1, y1 = bounds
     # Integer lattice permits exact shared vertices, eliminating T-junction cracks.
@@ -106,6 +108,10 @@ def build_cells(bounds, tree, near, middle, far, buffer, transition, max_cells):
         xa, ya = x0 + ix*step, y0 + iy*step
         xb, yb = min(x0+(ix+size)*step, x1), min(y0+(iy+size)*step, y1)
         footprint = box(xa, ya, xb, yb)
+        if corridor_only:
+            nearby = tree.query(footprint.buffer(corridor_radius))
+            if not any(footprint.distance(tree.geometries[int(i)]) <= corridor_radius for i in nearby):
+                return
         # Only query lines near the cell; never create a full-area high-resolution raster.
         candidates = tree.query(footprint.buffer(transition))
         distance = min((footprint.distance(tree.geometries[int(i)]) for i in candidates), default=float('inf'))
@@ -161,6 +167,103 @@ def mesh_topology(cells):
     return vertices, faces
 
 
+def polygon_parts(geom):
+    if geom.is_empty:
+        return
+    if geom.geom_type == 'Polygon':
+        if geom.area > 1e-9:
+            yield geom
+    elif hasattr(geom, 'geoms'):
+        for g in geom.geoms:
+            yield from polygon_parts(g)
+
+
+def export_corridor_tiled(out, dem, imagery_path, bounds, keys, elevations, valid,
+                          faces, step, base, corridor, resolution, tile_pixels):
+    """Clip terrain triangles to a single corridor and tile boundaries; per-tile UVs."""
+    from shapely.prepared import prep
+    from collections import defaultdict
+    b = bounds
+    tile_m = resolution * tile_pixels
+    x0, y0 = b.left, b.bottom
+    prepared = prep(corridor)
+    xy = [(min(b.right, x0 + ix * step), min(b.top, y0 + iy * step)) for ix,iy in keys]
+    # Store clipped polygons by tile; no giant full-extent texture.
+    tile_polygons = defaultdict(list)
+    for a,c,d in tqdm(faces, desc='Clipping terrain to corridor and tiles', unit='face'):
+        if not (valid[a-1] and valid[c-1] and valid[d-1]):
+            continue
+        tri = Polygon([xy[a-1],xy[c-1],xy[d-1]])
+        if tri.area < 1e-10 or not prepared.intersects(tri):
+            continue
+        clipped = tri.intersection(corridor)
+        for poly in polygon_parts(clipped):
+            minx,miny,maxx,maxy = poly.bounds
+            ix0 = max(0, math.floor((minx-x0)/tile_m))
+            iy0 = max(0, math.floor((miny-y0)/tile_m))
+            ix1 = math.floor((maxx-x0)/tile_m)
+            iy1 = math.floor((maxy-y0)/tile_m)
+            for iy in range(iy0,iy1+1):
+                for ix in range(ix0,ix1+1):
+                    tx0,ty0 = x0+ix*tile_m,y0+iy*tile_m
+                    piece = poly.intersection(box(tx0,ty0,tx0+tile_m,ty0+tile_m))
+                    for part in polygon_parts(piece):
+                        tile_polygons[(ix,iy)].append((part,(a,c,d)))
+    if not tile_polygons:
+        raise ValueError('No valid corridor terrain faces. Check DEM coverage and corridor location.')
+    # A per-tile OBJ object and material. Geometry is globally positioned and all
+    # vertices are written once per tile, using tile-local UVs.
+    textures = out/'textures'; textures.mkdir(exist_ok=True)
+    material_lines = []
+    vertex_index = 0
+    with rasterio.open(imagery_path) as imagery:
+        if imagery.crs is None: raise ValueError('Imagery has no CRS')
+        with (out/'terrain.obj').open('w',encoding='utf8') as obj:
+            obj.write('mtllib terrain.mtl\n')
+            for (ix,iy), pieces in tqdm(sorted(tile_polygons.items()), desc='Exporting texture tiles', unit='tile'):
+                tx0,ty0=x0+ix*tile_m,y0+iy*tile_m
+                tx1,ty1=min(tx0+tile_m,b.right),min(ty0+tile_m,b.top)
+                w=max(2,math.ceil((tx1-tx0)/resolution))
+                h=max(2,math.ceil((ty1-ty0)/resolution))
+                rgb=np.zeros((h,w,3),dtype=np.uint8)
+                dst_transform=from_bounds(tx0,ty0,tx1,ty1,w,h)
+                for ch in range(3):
+                    reproject(source=rasterio.band(imagery,min(ch+1,imagery.count)),
+                              destination=rgb[:,:,ch],src_transform=imagery.transform,
+                              src_crs=imagery.crs,src_nodata=imagery.nodata,
+                              dst_transform=dst_transform,dst_crs=dem.crs,dst_nodata=0,
+                              resampling=Resampling.bilinear)
+                texname=f'corridor_{ix}_{iy}.png'
+                Image.fromarray(rgb).save(textures/texname)
+                mat=f'Corridor_{ix}_{iy}'
+                material_lines.append(f'newmtl {mat}\nKd 1 1 1\nmap_Kd textures/{texname}\n')
+                obj.write(f'o Tile_{ix}_{iy}\nusemtl {mat}\n')
+                # Barycentric interpolation of elevations preserves the original
+                # triangle surface at clipped vertices and texture tile edges.
+                for part, ids in pieces:
+                    a,c,d=ids
+                    xA,yA=xy[a-1]; xB,yB=xy[c-1]; xC,yC=xy[d-1]
+                    denom=(yB-yC)*(xA-xC)+(xC-xB)*(yA-yC)
+                    if abs(denom)<1e-12: continue
+                    for triangle in constrained_delaunay_triangles(part).geoms:
+                        if triangle.area<1e-10: continue
+                        coords=list(triangle.exterior.coords)[:3]
+                        for x,y in coords:
+                            wa=((yB-yC)*(x-xC)+(xC-xB)*(y-yC))/denom
+                            wb=((yC-yA)*(x-xC)+(xA-xC)*(y-yC))/denom
+                            wc=1-wa-wb
+                            z=wa*elevations[a-1]+wb*elevations[c-1]+wc*elevations[d-1]
+                            u=(x-tx0)/(tx1-tx0)
+                            v=(y-ty0)/(ty1-ty0)
+                            obj.write(f'v {x-x0:.5f} {y-y0:.5f} {z-base:.5f}\n')
+                            obj.write(f'vt {u:.9f} {v:.9f}\n')
+                        obj.write(f'f {vertex_index+1}/{vertex_index+1} {vertex_index+2}/{vertex_index+2} {vertex_index+3}/{vertex_index+3}\n')
+                        vertex_index+=3
+    (out/'terrain.mtl').write_text('\n'.join(material_lines),encoding='utf8')
+    print(f'Corridor export: {len(tile_polygons):,} texture tiles, {vertex_index:,} OBJ vertices',flush=True)
+    return {'tiles':len(tile_polygons),'vertices':vertex_index}
+
+
 def main():
     p = argparse.ArgumentParser(description='Adaptive textured terrain OBJ refined around GeoPackage roads/railways')
     p.add_argument('--dem', required=True)
@@ -178,6 +281,10 @@ def main():
     p.add_argument('--max-cells', type=int, default=2_000_000)
     p.add_argument('--max-texture', type=int, default=8192)
     p.add_argument('--base-elevation', type=float)
+    p.add_argument('--corridor-only', action='store_true', help='Export only terrain inside the rail corridor buffer')
+    p.add_argument('--corridor-width', type=float, default=400, help='Total corridor width in meters')
+    p.add_argument('--texture-resolution', type=float, default=0.5, help='Texture meters per pixel in corridor mode')
+    p.add_argument('--texture-tile-size', type=int, default=2048, help='Maximum texture tile dimension in pixels')
     p.add_argument('--use-dem-line-z', action='store_true', help='Override any existing 3D GPKG Z values with DEM samples')
     args = p.parse_args()
     if not (0 < args.near_spacing <= args.transition_spacing <= args.background_spacing):
@@ -186,15 +293,34 @@ def main():
         p.error('Require 0 <= fine-buffer < transition-buffer')
     if args.max_texture < 2 or args.line_spacing <= 0 or args.max_cells <= 0:
         p.error('Invalid max-texture, line-spacing or max-cells')
+    if args.corridor_width <= 0 or args.texture_resolution <= 0 or args.texture_tile_size < 2:
+        p.error('Corridor width, texture resolution and texture tile size must be positive')
     out = Path(args.output); out.mkdir(parents=True,exist_ok=True)
     with rasterio.open(args.dem) as dem:
         if dem.crs is None or not dem.crs.is_projected or 'met' not in (dem.crs.linear_units or '').lower():
             raise ValueError('DEM must use a projected CRS in meters')
         b = dem.bounds
         tree,layers,lines = read_corridors(args.gpkg,args.layer,dem.crs)
+        corridor = None
+        if args.corridor_only:
+            print('Building corridor polygon...', flush=True)
+            corridor = unary_union([g.buffer(args.corridor_width / 2, quad_segs=4) for g in tqdm(lines, desc='Buffering lines', unit='line')])
+            corridor = corridor.intersection(box(*dem.bounds))
+            if corridor.is_empty:
+                raise ValueError('Corridor does not overlap DEM')
+            if corridor.geom_type == 'MultiPolygon':
+                # One continuous mesh region only, as requested. Do not create separate terrain islands.
+                corridor = max(corridor.geoms, key=lambda g: g.area)
+                print('Corridor has multiple components: using largest connected polygon only.', flush=True)
+            elif corridor.geom_type == 'GeometryCollection':
+                polys = [g for g in corridor.geoms if g.geom_type == 'Polygon']
+                if not polys: raise ValueError('No polygonal corridor inside DEM')
+                corridor = max(polys, key=lambda g: g.area)
+            print(f'Corridor area: {corridor.area / 1e6:.3f} km2', flush=True)
         cells,step = build_cells((b.left,b.bottom,b.right,b.top),tree,args.near_spacing,
                                  args.transition_spacing,args.background_spacing,
-                                 args.fine_buffer,args.transition_buffer,args.max_cells)
+                                 args.fine_buffer,args.transition_buffer,args.max_cells,
+                                 args.corridor_only,args.corridor_width/2)
         print(f'Adaptive cells: {len(cells):,}; building stitched topology...',flush=True)
         vertices,faces = mesh_topology(cells)
         print(f'Vertices: {len(vertices):,}; faces: {len(faces):,}; sampling DEM...',flush=True)
@@ -214,35 +340,41 @@ def main():
         if not valid.any():
             raise ValueError('No valid DEM elevations at mesh vertices')
         base = float(np.min(elevations[valid])) if args.base_elevation is None else args.base_elevation
-        with rasterio.open(args.imagery) as imagery:
-            if imagery.crs is None:
-                raise ValueError('Imagery has no CRS')
-            ratio = min(1,args.max_texture/max(imagery.width,imagery.height))
-            tw,th = max(2,round(imagery.width*ratio)),max(2,round(imagery.height*ratio))
-            dst_transform = from_bounds(b.left,b.bottom,b.right,b.top,tw,th)
-            rgb = np.zeros((th,tw,3),dtype=np.uint8)
-            for channel in tqdm(range(3), desc="Reprojecting imagery", unit="band"):
-                reproject(source=rasterio.band(imagery,min(channel+1,imagery.count)),
-                          destination=rgb[:,:,channel],src_transform=imagery.transform,
-                          src_crs=imagery.crs,src_nodata=imagery.nodata,
-                          dst_transform=dst_transform,dst_crs=dem.crs,dst_nodata=0,
-                          resampling=Resampling.bilinear)
-        Image.fromarray(rgb).save(out/'terrain_texture.png')
-        with (out/'terrain.obj').open('w',encoding='utf8') as f:
-            f.write('mtllib terrain.mtl\no Terrain\n')
-            for (ix,iy),z in tqdm(zip(keys,elevations), total=len(keys), desc="Writing OBJ vertices", unit="vertex"):
-                x=min(b.right,b.left+ix*step)-b.left
-                y=min(b.top,b.bottom+iy*step)-b.bottom
-                f.write(f'v {x:.5f} {y:.5f} {float(z-base) if np.isfinite(z) else 0:.5f}\n')
-            for ix,iy in tqdm(keys, desc="Writing texture UVs", unit="vertex"):
-                x=min(b.right,b.left+ix*step)
-                y=min(b.top,b.bottom+iy*step)
-                f.write(f'vt {(x-b.left)/(b.right-b.left):.9f} {(y-b.bottom)/(b.top-b.bottom):.9f}\n')
-            f.write('usemtl TerrainMaterial\n')
-            for a,c,d in tqdm(faces, desc="Writing OBJ faces", unit="face"):
-                if valid[a-1] and valid[c-1] and valid[d-1]:
-                    f.write(f'f {a}/{a} {c}/{c} {d}/{d}\n')
-        (out/'terrain.mtl').write_text('newmtl TerrainMaterial\nKd 1 1 1\nmap_Kd terrain_texture.png\n')
+        if args.corridor_only:
+            stats = export_corridor_tiled(out, dem, args.imagery, b, keys, elevations, valid, faces,
+                                          step, base, corridor, args.texture_resolution,
+                                          args.texture_tile_size)
+            tw = th = 0
+        else:
+            with rasterio.open(args.imagery) as imagery:
+                if imagery.crs is None:
+                    raise ValueError('Imagery has no CRS')
+                ratio = min(1,args.max_texture/max(imagery.width,imagery.height))
+                tw,th = max(2,round(imagery.width*ratio)),max(2,round(imagery.height*ratio))
+                dst_transform = from_bounds(b.left,b.bottom,b.right,b.top,tw,th)
+                rgb = np.zeros((th,tw,3),dtype=np.uint8)
+                for channel in tqdm(range(3), desc="Reprojecting imagery", unit="band"):
+                    reproject(source=rasterio.band(imagery,min(channel+1,imagery.count)),
+                              destination=rgb[:,:,channel],src_transform=imagery.transform,
+                              src_crs=imagery.crs,src_nodata=imagery.nodata,
+                              dst_transform=dst_transform,dst_crs=dem.crs,dst_nodata=0,
+                              resampling=Resampling.bilinear)
+            Image.fromarray(rgb).save(out/'terrain_texture.png')
+            with (out/'terrain.obj').open('w',encoding='utf8') as f:
+                f.write('mtllib terrain.mtl\no Terrain\n')
+                for (ix,iy),z in tqdm(zip(keys,elevations), total=len(keys), desc="Writing OBJ vertices", unit="vertex"):
+                    x=min(b.right,b.left+ix*step)-b.left
+                    y=min(b.top,b.bottom+iy*step)-b.bottom
+                    f.write(f'v {x:.5f} {y:.5f} {float(z-base) if np.isfinite(z) else 0:.5f}\n')
+                for ix,iy in tqdm(keys, desc="Writing texture UVs", unit="vertex"):
+                    x=min(b.right,b.left+ix*step)
+                    y=min(b.top,b.bottom+iy*step)
+                    f.write(f'vt {(x-b.left)/(b.right-b.left):.9f} {(y-b.bottom)/(b.top-b.bottom):.9f}\n')
+                f.write('usemtl TerrainMaterial\n')
+                for a,c,d in tqdm(faces, desc="Writing OBJ faces", unit="face"):
+                    if valid[a-1] and valid[c-1] and valid[d-1]:
+                        f.write(f'f {a}/{a} {c}/{c} {d}/{d}\n')
+            (out/'terrain.mtl').write_text('newmtl TerrainMaterial\nKd 1 1 1\nmap_Kd terrain_texture.png\n')
         export_lines(lines,dem,out,b.left,b.bottom,base,args.line_spacing,args.line_z_offset,not args.use_dem_line_z)
         (out/'georeference.json').write_text(json.dumps({
             'crs':str(dem.crs),'origin_x':b.left,'origin_y':b.bottom,
@@ -251,9 +383,12 @@ def main():
             'fine_buffer':args.fine_buffer,'transition_buffer':args.transition_buffer,
             'vertices':len(vertices),'triangles':len(faces),
             'note':'Requested spacing is a maximum target; quadtree levels are powers of two.',
-            'existing_line_z_preserved':not args.use_dem_line_z
+            'existing_line_z_preserved':not args.use_dem_line_z,
+            'corridor_only':args.corridor_only, 'corridor_width_m':args.corridor_width,
+            'texture_resolution_m_per_pixel':args.texture_resolution,
+            'texture_tile_max_pixels':args.texture_tile_size
         },indent=2))
-        print(f'Done: {out.resolve()} | {len(vertices):,} vertices, {len(faces):,} triangles, texture {tw}x{th}')
+        print(f'Done: {out.resolve()} | source mesh {len(vertices):,} vertices, {len(faces):,} triangles' + (' | corridor tiles: '+str(stats['tiles']) if args.corridor_only else f' | texture {tw}x{th}'))
 
 if __name__ == '__main__':
     main()
