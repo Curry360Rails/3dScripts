@@ -1,5 +1,9 @@
+"""Adaptive, crack-free terrain mesh from a DEM and GeoPackage corridor lines."""
 import argparse
+import bisect
+import json
 import math
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -9,179 +13,201 @@ from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
 from rasterio.warp import reproject, transform_geom
 
-
-def segments(geometry):
-    if not geometry:
-        return
-    kind = geometry.get('type')
-    coords = geometry.get('coordinates')
-    if kind == 'LineString':
-        yield coords
-    elif kind == 'MultiLineString':
-        yield from coords
-    elif kind == 'GeometryCollection':
-        for part in geometry.get('geometries', []):
-            yield from segments(part)
+from build_terrain import export_lines, segments
 
 
-def densify(line, spacing):
-    if not line:
-        return
-    prev = line[0]
-    yield prev[:2]
-    for point in line[1:]:
-        distance = math.hypot(point[0] - prev[0], point[1] - prev[1])
-        steps = max(1, math.ceil(distance / spacing))
-        for k in range(1, steps + 1):
-            t = k / steps
-            yield (prev[0] + t * (point[0] - prev[0]),
-                   prev[1] + t * (point[1] - prev[1]))
-        prev = point
-
-
-def export_lines(gpkg_path, layers, dem, out, origin_x, origin_y, base, spacing, z_offset):
-    try:
-        import pyogrio
-    except ImportError as exc:
-        raise RuntimeError('GeoPackage support requires Pyogrio: pip install pyogrio') from exc
-    if not Path(gpkg_path).is_file():
-        raise FileNotFoundError(gpkg_path)
-    available = pyogrio.list_layers(gpkg_path)[:, 0].tolist()
+def read_corridors(path, layers, target_crs):
+    import pyogrio
+    from shapely import from_wkb
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+    available = pyogrio.list_layers(path)[:, 0].tolist()
     selected = layers or available
-    missing = sorted(set(selected) - set(available))
+    missing = set(selected) - set(available)
     if missing:
-        raise ValueError(f'GPKG layers not found: {missing}. Available: {available}')
-    obj_path = out / 'network_lines.obj'
-    count = 0
-    with obj_path.open('w', encoding='utf-8') as obj:
-        obj.write('# Elevated polylines; edges only, no faces\n')
-        index = 1
-        for layer in selected:
-            from shapely.geometry import mapping
-            from shapely import from_wkb
-            info = pyogrio.read_info(gpkg_path, layer=layer)
-            source_crs = info.get('crs')
-            if not source_crs:
-                raise ValueError(f'Layer {layer!r} has no CRS')
-            # read_geometry=True returns WKB geometry with no GeoPandas dependency.
-            meta, table = pyogrio.read_arrow(gpkg_path, layer=layer, columns=[], read_geometry=True)
-            geometry_column = meta['geometry_name']
-            obj.write(f'o {layer.replace(" ", "_")}\n')
-            for wkb in table[geometry_column].to_pylist():
-                if wkb is None:
-                    continue
-                geom = transform_geom(source_crs, dem.crs, mapping(from_wkb(wkb)))
-                for segment in segments(geom):
-                    coords = list(densify(segment, spacing))
-                    if len(coords) < 2:
-                        continue
-                    elevations = list(dem.sample(coords, indexes=1, masked=True))
-                    chain = []
-                    for (x, y), sample in zip(coords, elevations):
-                        z = sample[0]
-                        if np.ma.is_masked(z) or not np.isfinite(z) or (dem.nodata is not None and z == dem.nodata):
-                            if len(chain) > 1:
-                                obj.write('l ' + ' '.join(map(str, chain)) + '\n')
-                            chain = []
-                            continue
-                        obj.write(f'v {x-origin_x:.4f} {y-origin_y:.4f} {float(z)-base+z_offset:.4f}\n')
-                        chain.append(index)
-                        index += 1
-                        count += 1
-                    if len(chain) > 1:
-                        obj.write('l ' + ' '.join(map(str, chain)) + '\n')
-    print(f'Created {obj_path} ({count:,} elevated polyline vertices; layers: {selected})')
-    return selected
+        raise ValueError(f'Unknown GPKG layers: {sorted(missing)}; available: {available}')
+    geometries = []
+    for layer in selected:
+        info = pyogrio.read_info(path, layer=layer)
+        if not info.get('crs'):
+            raise ValueError(f'Layer {layer} has no CRS')
+        meta, table = pyogrio.read_arrow(path, layer=layer, columns=[], read_geometry=True)
+        for wkb in table[meta['geometry_name']].to_pylist():
+            if wkb is None:
+                continue
+            projected = shape(transform_geom(info['crs'], target_crs, from_wkb(wkb).__geo_interface__))
+            if projected.is_empty:
+                continue
+            if projected.geom_type in ('LineString', 'MultiLineString'):
+                geometries.append(projected)
+            elif projected.geom_type == 'GeometryCollection':
+                geometries.extend(g for g in projected.geoms if g.geom_type in ('LineString', 'MultiLineString'))
+    if not geometries:
+        raise ValueError('No line geometries found in selected GPKG layers')
+    from shapely.strtree import STRtree
+    return STRtree(geometries), selected
+
+
+def build_cells(bounds, tree, near, middle, far, buffer, transition, max_cells):
+    from shapely.geometry import box
+    x0, y0, x1, y1 = bounds
+    # Integer lattice permits exact shared vertices, eliminating T-junction cracks.
+    levels = max(1, math.ceil(math.log2(far / near)))
+    scale = 2 ** levels
+    step = far / scale
+    nx = math.ceil((x1-x0) / far)
+    ny = math.ceil((y1-y0) / far)
+    cells = []
+    def subdivide(ix, iy, size):
+        xa, ya = x0 + ix*step, y0 + iy*step
+        xb, yb = min(x0+(ix+size)*step, x1), min(y0+(iy+size)*step, y1)
+        footprint = box(xa, ya, xb, yb)
+        # Only query lines near the cell; never create a full-area high-resolution raster.
+        candidates = tree.query(footprint.buffer(transition))
+        distance = min((footprint.distance(tree.geometries[int(i)]) for i in candidates), default=float('inf'))
+        target = near if distance <= buffer else middle if distance <= transition else far
+        if max(xb-xa, yb-ya) > target and size > 1:
+            half = size//2
+            for dy in (0, half):
+                for dx in (0, half):
+                    subdivide(ix+dx, iy+dy, half)
+        else:
+            cells.append((ix, iy, size))
+            if len(cells) > max_cells:
+                raise ValueError(f'Exceeded --max-cells={max_cells:,}; increase spacing or reduce buffers')
+    for j in range(ny):
+        for i in range(nx):
+            subdivide(i*scale, j*scale, scale)
+    return cells, step
+
+
+def mesh_topology(cells):
+    horizontal = defaultdict(set)
+    vertical = defaultdict(set)
+    for x,y,s in cells:
+        for yy in (y,y+s):
+            horizontal[yy].update((x,x+s))
+        for xx in (x,x+s):
+            vertical[xx].update((y,y+s))
+    hs = {k:sorted(v) for k,v in horizontal.items()}
+    vs = {k:sorted(v) for k,v in vertical.items()}
+    vertices = {}
+    faces = []
+    def index(point):
+        if point not in vertices:
+            vertices[point] = len(vertices)+1
+        return vertices[point]
+    for x,y,s in cells:
+        # Perimeter CCW; intermediate points from finer neighboring cells stitch edges.
+        low = hs[y]; high = hs[y+s]; left = vs[x]; right = vs[x+s]
+        bottom = low[bisect.bisect_left(low,x):bisect.bisect_right(low,x+s)]
+        east = right[bisect.bisect_right(right,y):bisect.bisect_right(right,y+s)]
+        top = high[bisect.bisect_left(high,x):bisect.bisect_left(high,x+s)]
+        west = left[bisect.bisect_right(left,y):bisect.bisect_left(left,y+s)]
+        ring = ([(v,y) for v in bottom] + [(x+s,v) for v in east]
+                + [(v,y+s) for v in reversed(top[:-1])] + [(x,v) for v in reversed(west)])
+        # Remove duplicate corners and any repeated vertices.
+        ring = list(dict.fromkeys(ring))
+        center = (x+s/2,y+s/2)
+        ci = index(center)
+        ids = [index(pt) for pt in ring]
+        for a,b in zip(ids, ids[1:]+ids[:1]):
+            if a != b:
+                faces.append((ci,a,b))
+    return vertices, faces
 
 
 def main():
-    p = argparse.ArgumentParser(description='Build textured terrain OBJ and optionally elevated GPKG polylines.')
-    p.add_argument('--dem', required=True, help='Elevation GeoTIFF')
-    p.add_argument('--imagery', required=True, help='Satellite imagery GeoTIFF')
+    p = argparse.ArgumentParser(description='Adaptive textured terrain OBJ refined around GeoPackage roads/railways')
+    p.add_argument('--dem', required=True)
+    p.add_argument('--imagery', required=True)
+    p.add_argument('--gpkg', required=True)
+    p.add_argument('--layer', action='append', help='Repeat for multiple layers; default all')
     p.add_argument('--output', default='terrain_output')
-    p.add_argument('--spacing', type=float, default=10, help='Target terrain vertex spacing in meters; smaller = more detail')
-    p.add_argument('--max-vertices', type=int, default=3_000_000)
+    p.add_argument('--near-spacing', type=float, default=3)
+    p.add_argument('--transition-spacing', type=float, default=10)
+    p.add_argument('--background-spacing', type=float, default=70)
+    p.add_argument('--fine-buffer', type=float, default=50)
+    p.add_argument('--transition-buffer', type=float, default=200)
+    p.add_argument('--line-spacing', type=float, default=3)
+    p.add_argument('--line-z-offset', type=float, default=0.5)
+    p.add_argument('--max-cells', type=int, default=2_000_000)
     p.add_argument('--max-texture', type=int, default=8192)
-    p.add_argument('--base-elevation', type=float, default=None)
-    p.add_argument('--gpkg', help='Optional GeoPackage with roads/railways')
-    p.add_argument('--layer', action='append', help='GPKG layer to include; repeat for multiple. Default: all layers')
-    p.add_argument('--line-spacing', type=float, default=5, help='Maximum polyline segment length in meters')
-    p.add_argument('--line-z-offset', type=float, default=0.5, help='Meters above DEM to prevent z-fighting')
+    p.add_argument('--base-elevation', type=float)
     args = p.parse_args()
-    if args.spacing <= 0 or args.line_spacing <= 0 or args.max_texture < 2:
-        p.error('Spacing values must be positive and max-texture must be >= 2')
-    out = Path(args.output)
-    out.mkdir(parents=True, exist_ok=True)
+    if not (0 < args.near_spacing <= args.transition_spacing <= args.background_spacing):
+        p.error('Require 0 < near-spacing <= transition-spacing <= background-spacing')
+    if not (0 <= args.fine_buffer < args.transition_buffer):
+        p.error('Require 0 <= fine-buffer < transition-buffer')
+    if args.max_texture < 2 or args.line_spacing <= 0 or args.max_cells <= 0:
+        p.error('Invalid max-texture, line-spacing or max-cells')
+    out = Path(args.output); out.mkdir(parents=True,exist_ok=True)
     with rasterio.open(args.dem) as dem:
         if dem.crs is None or not dem.crs.is_projected or 'met' not in (dem.crs.linear_units or '').lower():
-            raise ValueError('DEM must use a projected CRS with meter units')
-        bounds = dem.bounds
-        width = max(2, math.ceil((bounds.right - bounds.left) / args.spacing))
-        height = max(2, math.ceil((bounds.top - bounds.bottom) / args.spacing))
-        if width * height > args.max_vertices:
-            raise ValueError(f'Mesh would contain {width*height:,} vertices; increase --spacing or --max-vertices. '
-                             'Warning: very large meshes can be slow in Blender and AnyLogic.')
-        transform = from_bounds(bounds.left, bounds.bottom, bounds.right, bounds.top, width, height)
-        elevation = np.full((height, width), np.nan, dtype='float32')
-        reproject(source=rasterio.band(dem, 1), destination=elevation,
-                  src_transform=dem.transform, src_crs=dem.crs, src_nodata=dem.nodata,
-                  dst_transform=transform, dst_crs=dem.crs, dst_nodata=np.nan,
-                  resampling=Resampling.bilinear)
-        valid = np.isfinite(elevation)
+            raise ValueError('DEM must use a projected CRS in meters')
+        b = dem.bounds
+        tree,layers = read_corridors(args.gpkg,args.layer,dem.crs)
+        cells,step = build_cells((b.left,b.bottom,b.right,b.top),tree,args.near_spacing,
+                                 args.transition_spacing,args.background_spacing,
+                                 args.fine_buffer,args.transition_buffer,args.max_cells)
+        print(f'Adaptive cells: {len(cells):,}; building stitched topology...',flush=True)
+        vertices,faces = mesh_topology(cells)
+        print(f'Vertices: {len(vertices):,}; faces: {len(faces):,}; sampling DEM...',flush=True)
+        keys = list(vertices)
+        # DEM sampling in bounded batches; sample at actual vertex locations.
+        elevations = np.full(len(keys),np.nan,dtype=np.float32)
+        for start in range(0,len(keys),25000):
+            chunk = keys[start:start+25000]
+            coords = [(min(b.right-1e-7,b.left+k[0]*step),
+                       min(b.top-1e-7,b.bottom+k[1]*step)) for k in chunk]
+            samples = dem.sample(coords,indexes=1,masked=True)
+            for j,sample in enumerate(samples):
+                z = sample[0]
+                if not np.ma.is_masked(z) and np.isfinite(z) and (dem.nodata is None or z != dem.nodata):
+                    elevations[start+j] = z
+        valid = np.isfinite(elevations)
         if not valid.any():
-            raise ValueError('DEM has no valid elevation cells')
-        base = float(np.nanmin(elevation)) if args.base_elevation is None else args.base_elevation
+            raise ValueError('No valid DEM elevations at mesh vertices')
+        base = float(np.min(elevations[valid])) if args.base_elevation is None else args.base_elevation
         with rasterio.open(args.imagery) as imagery:
             if imagery.crs is None:
-                raise ValueError('Imagery must have a CRS')
-            scale = min(1.0, args.max_texture / max(imagery.width, imagery.height))
-            tex_w = max(2, round(imagery.width * scale))
-            tex_h = max(2, round(imagery.height * scale))
-            tex_transform = from_bounds(bounds.left, bounds.bottom, bounds.right, bounds.top, tex_w, tex_h)
-            rgb = np.zeros((tex_h, tex_w, 3), dtype=np.uint8)
+                raise ValueError('Imagery has no CRS')
+            ratio = min(1,args.max_texture/max(imagery.width,imagery.height))
+            tw,th = max(2,round(imagery.width*ratio)),max(2,round(imagery.height*ratio))
+            dst_transform = from_bounds(b.left,b.bottom,b.right,b.top,tw,th)
+            rgb = np.zeros((th,tw,3),dtype=np.uint8)
             for channel in range(3):
-                reproject(source=rasterio.band(imagery, min(channel+1, imagery.count)),
-                          destination=rgb[:, :, channel], src_transform=imagery.transform,
-                          src_crs=imagery.crs, src_nodata=imagery.nodata,
-                          dst_transform=tex_transform, dst_crs=dem.crs, dst_nodata=0,
+                reproject(source=rasterio.band(imagery,min(channel+1,imagery.count)),
+                          destination=rgb[:,:,channel],src_transform=imagery.transform,
+                          src_crs=imagery.crs,src_nodata=imagery.nodata,
+                          dst_transform=dst_transform,dst_crs=dem.crs,dst_nodata=0,
                           resampling=Resampling.bilinear)
-        Image.fromarray(rgb).save(out / 'terrain_texture.png')
-        xs = transform.c + (np.arange(width) + 0.5) * transform.a
-        ys = transform.f + (np.arange(height) + 0.5) * transform.e
-        with (out / 'terrain.obj').open('w', encoding='utf-8') as obj:
-            obj.write('mtllib terrain.mtl\no Terrain\n')
-            for r in range(height):
-                for c in range(width):
-                    z = float(elevation[r, c] - base) if valid[r, c] else 0.0
-                    obj.write(f'v {xs[c]-bounds.left:.4f} {ys[r]-bounds.bottom:.4f} {z:.4f}\n')
-            for r in range(height):
-                for c in range(width):
-                    obj.write(f'vt {(c+.5)/width:.8f} {1-(r+.5)/height:.8f}\n')
-            obj.write('usemtl TerrainMaterial\n')
-            for r in range(height-1):
-                for c in range(width-1):
-                    if not valid[r:r+2, c:c+2].all():
-                        continue
-                    a = r*width+c+1
-                    b, d = a+1, a+width
-                    e = d+1
-                    obj.write(f'f {a}/{a} {d}/{d} {b}/{b}\n')
-                    obj.write(f'f {b}/{b} {d}/{d} {e}/{e}\n')
-        (out / 'terrain.mtl').write_text('newmtl TerrainMaterial\nKd 1 1 1\nmap_Kd terrain_texture.png\n', encoding='utf-8')
-        layers = []
-        if args.gpkg:
-            layers = export_lines(args.gpkg, args.layer, dem, out, bounds.left, bounds.bottom,
-                                  base, args.line_spacing, args.line_z_offset)
-        (out / 'georeference.txt').write_text(
-            f'CRS: {dem.crs}\nSouthwest bounds origin X: {bounds.left}\n'
-            f'Southwest bounds origin Y: {bounds.bottom}\nBase elevation: {base}\n'
-            f'Mesh dimensions: {width} x {height}\nActual spacing X: {transform.a}\n'
-            f'Actual spacing Y: {-transform.e}\nPolyline layers: {layers}\n'
-            f'Polyline Z offset: {args.line_z_offset}\n', encoding='utf-8')
-        print(f'Created {out / "terrain.obj"} ({width*height:,} vertices), texture {tex_w} x {tex_h}')
-        print('Import terrain.obj and network_lines.obj (if generated) separately into Blender.')
-        print('Note: network_lines.obj contains edges, not rendered road surfaces or AnyLogic network elements.')
-
+        Image.fromarray(rgb).save(out/'terrain_texture.png')
+        with (out/'terrain.obj').open('w',encoding='utf8') as f:
+            f.write('mtllib terrain.mtl\no Terrain\n')
+            for (ix,iy),z in zip(keys,elevations):
+                x=min(b.right,b.left+ix*step)-b.left
+                y=min(b.top,b.bottom+iy*step)-b.bottom
+                f.write(f'v {x:.5f} {y:.5f} {float(z-base) if np.isfinite(z) else 0:.5f}\n')
+            for ix,iy in keys:
+                x=min(b.right,b.left+ix*step)
+                y=min(b.top,b.bottom+iy*step)
+                f.write(f'vt {(x-b.left)/(b.right-b.left):.9f} {(y-b.bottom)/(b.top-b.bottom):.9f}\n')
+            f.write('usemtl TerrainMaterial\n')
+            for a,c,d in faces:
+                if valid[a-1] and valid[c-1] and valid[d-1]:
+                    f.write(f'f {a}/{a} {c}/{c} {d}/{d}\n')
+        (out/'terrain.mtl').write_text('newmtl TerrainMaterial\nKd 1 1 1\nmap_Kd terrain_texture.png\n')
+        export_lines(args.gpkg,args.layer,dem,out,b.left,b.bottom,base,args.line_spacing,args.line_z_offset)
+        (out/'georeference.json').write_text(json.dumps({
+            'crs':str(dem.crs),'origin_x':b.left,'origin_y':b.bottom,
+            'base_elevation':base,'layers':layers,'near_spacing':args.near_spacing,
+            'transition_spacing':args.transition_spacing,'background_spacing':args.background_spacing,
+            'fine_buffer':args.fine_buffer,'transition_buffer':args.transition_buffer,
+            'vertices':len(vertices),'triangles':len(faces),
+            'note':'Requested spacing is a maximum target; quadtree levels are powers of two.'
+        },indent=2))
+        print(f'Done: {out.resolve()} | {len(vertices):,} vertices, {len(faces):,} triangles, texture {tw}x{th}')
 
 if __name__ == '__main__':
     main()
