@@ -6,6 +6,8 @@ import math
 from collections import defaultdict
 from pathlib import Path
 
+from tqdm.auto import tqdm
+
 import numpy as np
 import rasterio
 from PIL import Image
@@ -25,7 +27,7 @@ def load_lines(path, layers, target_crs):
     if set(selected) - set(available):
         raise ValueError(f"Unknown GPKG layers: {sorted(set(selected)-set(available))}")
     geometries = []
-    for layer in selected:
+    for layer in tqdm(selected, desc="Reading GPKG layers", unit="layer"):
         info = pyogrio.read_info(path, layer=layer)
         source_crs = info.get('crs')
         if not source_crs:
@@ -57,7 +59,7 @@ def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offs
     with path.open('w', encoding='utf-8') as obj:
         obj.write('# Polyline edges only (not rendered surfaces)\n')
         obj.write('o Transport_Lines\n')
-        for geom in geometries:
+        for geom in tqdm(geometries, desc="Exporting rail/road lines", unit="line"):
             raw = list(geom.coords)
             if len(raw) < 2:
                 continue
@@ -117,7 +119,7 @@ def build_cells(bounds, tree, near, middle, far, buffer, transition, max_cells):
             cells.append((ix, iy, size))
             if len(cells) > max_cells:
                 raise ValueError(f'Exceeded --max-cells={max_cells:,}; increase spacing or reduce buffers')
-    for j in range(ny):
+    for j in tqdm(range(ny), desc="Refining terrain cells", unit="row"):
         for i in range(nx):
             subdivide(i*scale, j*scale, scale)
     return cells, step
@@ -126,7 +128,7 @@ def build_cells(bounds, tree, near, middle, far, buffer, transition, max_cells):
 def mesh_topology(cells):
     horizontal = defaultdict(set)
     vertical = defaultdict(set)
-    for x,y,s in cells:
+    for x,y,s in tqdm(cells, desc="Indexing cell edges", unit="cell"):
         for yy in (y,y+s):
             horizontal[yy].update((x,x+s))
         for xx in (x,x+s):
@@ -139,7 +141,7 @@ def mesh_topology(cells):
         if point not in vertices:
             vertices[point] = len(vertices)+1
         return vertices[point]
-    for x,y,s in cells:
+    for x,y,s in tqdm(cells, desc="Stitching triangles", unit="cell"):
         # Perimeter CCW; intermediate points from finer neighboring cells stitch edges.
         low = hs[y]; high = hs[y+s]; left = vs[x]; right = vs[x+s]
         bottom = low[bisect.bisect_left(low,x):bisect.bisect_right(low,x+s)]
@@ -199,7 +201,7 @@ def main():
         keys = list(vertices)
         # DEM sampling in bounded batches; sample at actual vertex locations.
         elevations = np.full(len(keys),np.nan,dtype=np.float32)
-        for start in range(0,len(keys),25000):
+        for start in tqdm(range(0,len(keys),25000), desc="Sampling DEM", unit="batch"):
             chunk = keys[start:start+25000]
             coords = [(min(b.right-1e-7,b.left+k[0]*step),
                        min(b.top-1e-7,b.bottom+k[1]*step)) for k in chunk]
@@ -219,7 +221,7 @@ def main():
             tw,th = max(2,round(imagery.width*ratio)),max(2,round(imagery.height*ratio))
             dst_transform = from_bounds(b.left,b.bottom,b.right,b.top,tw,th)
             rgb = np.zeros((th,tw,3),dtype=np.uint8)
-            for channel in range(3):
+            for channel in tqdm(range(3), desc="Reprojecting imagery", unit="band"):
                 reproject(source=rasterio.band(imagery,min(channel+1,imagery.count)),
                           destination=rgb[:,:,channel],src_transform=imagery.transform,
                           src_crs=imagery.crs,src_nodata=imagery.nodata,
@@ -228,16 +230,16 @@ def main():
         Image.fromarray(rgb).save(out/'terrain_texture.png')
         with (out/'terrain.obj').open('w',encoding='utf8') as f:
             f.write('mtllib terrain.mtl\no Terrain\n')
-            for (ix,iy),z in zip(keys,elevations):
+            for (ix,iy),z in tqdm(zip(keys,elevations), total=len(keys), desc="Writing OBJ vertices", unit="vertex"):
                 x=min(b.right,b.left+ix*step)-b.left
                 y=min(b.top,b.bottom+iy*step)-b.bottom
                 f.write(f'v {x:.5f} {y:.5f} {float(z-base) if np.isfinite(z) else 0:.5f}\n')
-            for ix,iy in keys:
+            for ix,iy in tqdm(keys, desc="Writing texture UVs", unit="vertex"):
                 x=min(b.right,b.left+ix*step)
                 y=min(b.top,b.bottom+iy*step)
                 f.write(f'vt {(x-b.left)/(b.right-b.left):.9f} {(y-b.bottom)/(b.top-b.bottom):.9f}\n')
             f.write('usemtl TerrainMaterial\n')
-            for a,c,d in faces:
+            for a,c,d in tqdm(faces, desc="Writing OBJ faces", unit="face"):
                 if valid[a-1] and valid[c-1] and valid[d-1]:
                     f.write(f'f {a}/{a} {c}/{c} {d}/{d}\n')
         (out/'terrain.mtl').write_text('newmtl TerrainMaterial\nKd 1 1 1\nmap_Kd terrain_texture.png\n')
