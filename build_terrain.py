@@ -27,27 +27,29 @@ from shapely.geometry import shape
 
 def load_lines(path, layers, target_crs, preserve_original_crs=False):
     import pyogrio
+    from pyogrio.raw import read as read_raw
+
     available = pyogrio.list_layers(path)[:, 0].tolist()
     selected = layers or available
-    if set(selected) - set(available):
-        raise ValueError(f"Unknown GPKG layers: {sorted(set(selected)-set(available))}")
+    missing = set(selected) - set(available)
+    if missing:
+        raise ValueError(f"Unknown GPKG layers: {sorted(missing)}")
+
     geometries = []
     for layer in tqdm(selected, desc="Reading GPKG layers", unit="layer"):
         info = pyogrio.read_info(path, layer=layer)
         source_crs = info.get('crs')
 
-if not source_crs:
-    if preserve_original_crs:
-        print(
-            f"WARNING: Layer {layer!r} has no stored CRS. "
-            "Preserving original coordinates without reprojection."
-        )
-    else:
-        raise ValueError(
-            f"Layer {layer!r} has no stored CRS. "
-            "Cannot safely reproject geometry."
-        )
-        from pyogrio.raw import read as read_raw
+        if not source_crs:
+            if preserve_original_crs:
+                print(f"WARNING: Layer {layer!r} has no stored CRS; preserving original coordinates. "
+                      "Confirm they use the DEM's CRS for correct alignment.")
+            else:
+                raise ValueError(f"Layer {layer!r} has no stored CRS; cannot safely reproject")
+        elif preserve_original_crs:
+            if rasterio.crs.CRS.from_user_input(source_crs) != rasterio.crs.CRS.from_user_input(target_crs):
+                raise ValueError(f"Exact-vertex export requires matching CRS: {source_crs} != {target_crs}")
+
         _, _, wkbs, _ = read_raw(path, layer=layer, columns=[], read_geometry=True)
         for wkb in wkbs:
             if wkb is None:
@@ -55,28 +57,19 @@ if not source_crs:
             geom = from_wkb(wkb)
             if geom.is_empty:
                 continue
-            # Avoid unnecessary coordinate transformation for matching CRS.
-            same_crs = rasterio.crs.CRS.from_user_input(source_crs) == rasterio.crs.CRS.from_user_input(target_crs)
-            if preserve_original_crs and not same_crs:
-                raise ValueError(f"Exact-vertex export requires matching CRS: {source_crs} != {target_crs}")
-                if preserve_original_crs:
-                    projected = geom
-                else:
-                    projected = geom if same_crs else shape(transform_geom(source_crs, target_crs, geom.__geo_interface__))
-                    #projected = shape(
-                    #    transform_geom(
-                    #        source_crs,
-                    #        target_crs,
-                    #        geom.__geo_interface__
-                    #    )
-                    #)
-            
+            if preserve_original_crs:
+                projected = geom
+            else:
+                same_crs = rasterio.crs.CRS.from_user_input(source_crs) == rasterio.crs.CRS.from_user_input(target_crs)
+                projected = geom if same_crs else shape(transform_geom(source_crs, target_crs, geom.__geo_interface__))
+
             if projected.geom_type == 'LineString':
                 geometries.append(projected)
             elif projected.geom_type == 'MultiLineString':
                 geometries.extend(projected.geoms)
             elif projected.geom_type == 'GeometryCollection':
                 geometries.extend(g for g in projected.geoms if g.geom_type == 'LineString')
+
     if not geometries:
         raise ValueError('No line geometries found in selected GPKG layers')
     return geometries, selected
