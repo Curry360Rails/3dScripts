@@ -13,39 +13,81 @@ from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
 from rasterio.warp import reproject, transform_geom
 
-from build_terrain import export_lines, segments
+from shapely.geometry import LineString, MultiLineString, GeometryCollection
+from shapely import from_wkb
+from shapely.geometry import shape
 
 
-def read_corridors(path, layers, target_crs):
+def load_lines(path, layers, target_crs):
     import pyogrio
-    from shapely import from_wkb
-    from shapely.geometry import shape
-    from shapely.ops import unary_union
     available = pyogrio.list_layers(path)[:, 0].tolist()
     selected = layers or available
-    missing = set(selected) - set(available)
-    if missing:
-        raise ValueError(f'Unknown GPKG layers: {sorted(missing)}; available: {available}')
+    if set(selected) - set(available):
+        raise ValueError(f"Unknown GPKG layers: {sorted(set(selected)-set(available))}")
     geometries = []
     for layer in selected:
         info = pyogrio.read_info(path, layer=layer)
-        if not info.get('crs'):
-            raise ValueError(f'Layer {layer} has no CRS')
+        source_crs = info.get('crs')
+        if not source_crs:
+            raise ValueError(f"Layer {layer!r} has no stored CRS; assign its verified CRS before proceeding")
         meta, table = pyogrio.read_arrow(path, layer=layer, columns=[], read_geometry=True)
-        for wkb in table[meta['geometry_name']].to_pylist():
+        geometry_column = meta['geometry_name']
+        for wkb in table[geometry_column].to_pylist():
             if wkb is None:
                 continue
-            projected = shape(transform_geom(info['crs'], target_crs, from_wkb(wkb).__geo_interface__))
-            if projected.is_empty:
+            geom = from_wkb(wkb)
+            if geom.is_empty:
                 continue
-            if projected.geom_type in ('LineString', 'MultiLineString'):
+            projected = shape(transform_geom(source_crs, target_crs, geom.__geo_interface__))
+            if projected.geom_type == 'LineString':
                 geometries.append(projected)
+            elif projected.geom_type == 'MultiLineString':
+                geometries.extend(projected.geoms)
             elif projected.geom_type == 'GeometryCollection':
-                geometries.extend(g for g in projected.geoms if g.geom_type in ('LineString', 'MultiLineString'))
+                geometries.extend(g for g in projected.geoms if g.geom_type == 'LineString')
     if not geometries:
         raise ValueError('No line geometries found in selected GPKG layers')
+    return geometries, selected
+
+
+def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offset, preserve_z):
+    path = out / 'network_lines.obj'
+    idx = 1
+    count = 0
+    with path.open('w', encoding='utf-8') as obj:
+        obj.write('# Polyline edges only (not rendered surfaces)\n')
+        obj.write('o Transport_Lines\n')
+        for geom in geometries:
+            raw = list(geom.coords)
+            if len(raw) < 2:
+                continue
+            pts = [raw[0]]
+            for a, b in zip(raw, raw[1:]):
+                steps = max(1, math.ceil(math.hypot(b[0]-a[0], b[1]-a[1]) / spacing))
+                for j in range(1, steps+1):
+                    t = j/steps
+                    pts.append(tuple(a[k]+t*(b[k]-a[k]) for k in range(min(len(a),len(b)))))
+            has_z = preserve_z and geom.has_z
+            samples = None if has_z else dem.sample([(p[0],p[1]) for p in pts], indexes=1, masked=True)
+            chain = []
+            for j,p in enumerate(pts):
+                z = p[2] if has_z else next(samples)[0]
+                if np.ma.is_masked(z) or not np.isfinite(z) or (not has_z and dem.nodata is not None and z == dem.nodata):
+                    if len(chain)>1: obj.write('l '+' '.join(map(str,chain))+'\n')
+                    chain=[]
+                    continue
+                obj.write(f'v {p[0]-origin_x:.5f} {p[1]-origin_y:.5f} {float(z)-base+z_offset:.5f}\n')
+                chain.append(idx); idx+=1; count+=1
+            if len(chain)>1:
+                obj.write('l '+' '.join(map(str,chain))+'\n')
+    print(f'Exported {count:,} line vertices to {path}', flush=True)
+
+
+
+def read_corridors(path, layers, target_crs):
     from shapely.strtree import STRtree
-    return STRtree(geometries), selected
+    geometries, selected = load_lines(path, layers, target_crs)
+    return STRtree(geometries), selected, geometries
 
 
 def build_cells(bounds, tree, near, middle, far, buffer, transition, max_cells):
@@ -105,7 +147,7 @@ def mesh_topology(cells):
         top = high[bisect.bisect_left(high,x):bisect.bisect_left(high,x+s)]
         west = left[bisect.bisect_right(left,y):bisect.bisect_left(left,y+s)]
         ring = ([(v,y) for v in bottom] + [(x+s,v) for v in east]
-                + [(v,y+s) for v in reversed(top[:-1])] + [(x,v) for v in reversed(west)])
+                + [(v,y+s) for v in reversed(top)] + [(x,v) for v in reversed(west)])
         # Remove duplicate corners and any repeated vertices.
         ring = list(dict.fromkeys(ring))
         center = (x+s/2,y+s/2)
@@ -134,6 +176,7 @@ def main():
     p.add_argument('--max-cells', type=int, default=2_000_000)
     p.add_argument('--max-texture', type=int, default=8192)
     p.add_argument('--base-elevation', type=float)
+    p.add_argument('--use-dem-line-z', action='store_true', help='Override any existing 3D GPKG Z values with DEM samples')
     args = p.parse_args()
     if not (0 < args.near_spacing <= args.transition_spacing <= args.background_spacing):
         p.error('Require 0 < near-spacing <= transition-spacing <= background-spacing')
@@ -146,7 +189,7 @@ def main():
         if dem.crs is None or not dem.crs.is_projected or 'met' not in (dem.crs.linear_units or '').lower():
             raise ValueError('DEM must use a projected CRS in meters')
         b = dem.bounds
-        tree,layers = read_corridors(args.gpkg,args.layer,dem.crs)
+        tree,layers,lines = read_corridors(args.gpkg,args.layer,dem.crs)
         cells,step = build_cells((b.left,b.bottom,b.right,b.top),tree,args.near_spacing,
                                  args.transition_spacing,args.background_spacing,
                                  args.fine_buffer,args.transition_buffer,args.max_cells)
@@ -198,14 +241,15 @@ def main():
                 if valid[a-1] and valid[c-1] and valid[d-1]:
                     f.write(f'f {a}/{a} {c}/{c} {d}/{d}\n')
         (out/'terrain.mtl').write_text('newmtl TerrainMaterial\nKd 1 1 1\nmap_Kd terrain_texture.png\n')
-        export_lines(args.gpkg,args.layer,dem,out,b.left,b.bottom,base,args.line_spacing,args.line_z_offset)
+        export_lines(lines,dem,out,b.left,b.bottom,base,args.line_spacing,args.line_z_offset,not args.use_dem_line_z)
         (out/'georeference.json').write_text(json.dumps({
             'crs':str(dem.crs),'origin_x':b.left,'origin_y':b.bottom,
             'base_elevation':base,'layers':layers,'near_spacing':args.near_spacing,
             'transition_spacing':args.transition_spacing,'background_spacing':args.background_spacing,
             'fine_buffer':args.fine_buffer,'transition_buffer':args.transition_buffer,
             'vertices':len(vertices),'triangles':len(faces),
-            'note':'Requested spacing is a maximum target; quadtree levels are powers of two.'
+            'note':'Requested spacing is a maximum target; quadtree levels are powers of two.',
+            'existing_line_z_preserved':not args.use_dem_line_z
         },indent=2))
         print(f'Done: {out.resolve()} | {len(vertices):,} vertices, {len(faces):,} triangles, texture {tw}x{th}')
 
