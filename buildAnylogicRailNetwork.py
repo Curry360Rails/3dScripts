@@ -75,6 +75,7 @@ def name_of(track):
     return '<unnamed>'
 
 def enumerate_tracks(level):
+    from anylogic_design_time_api.generated import RailTrack
     tracks = []
 
     for child in level.getChildren():
@@ -82,12 +83,12 @@ def enumerate_tracks(level):
         raw_type = str(child.item.typeName())
 
         if raw_type == "RailTrack":
-            tracks.append(child)
+            tracks.append(RailTrack(child.pyWorkspace, child.item))
 
         elif raw_type in ("Railyard", "RailwayNetwork"):
             for element in child.getChildren():
                 if str(element.item.typeName()) == "RailTrack":
-                    tracks.append(element)
+                    tracks.append(RailTrack(element.pyWorkspace, element.item))
 
     return tracks, "level / Railyard"
 
@@ -125,7 +126,7 @@ def main():
     ws = Workspace(TOKEN)
     level = ws.getModel(MODEL_NAME).getAgent(AGENT_NAME).getLevels()[LEVEL_INDEX]
     tracks, getter = enumerate_tracks(level)
-    print(f'Enumerated {len(tracks)} RailTracks via level.{getter}()')
+    print(f'Enumerated {len(tracks)} RailTracks via {getter}')
     if NAME_PREFIX is not None:
         tracks = [t for t in tracks if name_of(t).startswith(NAME_PREFIX)]
     print(f'Checking {len(tracks)} tracks (prefix={NAME_PREFIX!r})')
