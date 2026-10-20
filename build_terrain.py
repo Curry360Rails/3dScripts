@@ -318,8 +318,9 @@ def export_corridor_tiled(out, dem, imagery_path, bounds, keys, elevations, vali
 def main():
     p = argparse.ArgumentParser(description='Adaptive textured terrain OBJ refined around GeoPackage roads/railways')
     p.add_argument('--dem', required=True)
-    p.add_argument('--imagery', required=True)
+    p.add_argument('--imagery', help='Satellite GeoTIFF (not required with --network-only)')
     p.add_argument('--gpkg', required=True)
+    p.add_argument('--network-only', action='store_true', help='Export only network_lines.obj from GPKG; skip terrain and imagery')
     p.add_argument('--layer', action='append', help='Repeat for multiple layers; default all')
     p.add_argument('--output', default='terrain_output')
     p.add_argument('--near-spacing', type=float, default=3)
@@ -340,6 +341,8 @@ def main():
     p.add_argument('--texture-tile-size', type=int, default=2048, help='Maximum texture tile dimension in pixels')
     p.add_argument('--use-dem-line-z', action='store_true', help='Override any existing 3D GPKG Z values with DEM samples')
     args = p.parse_args()
+    if not args.network_only and not args.imagery:
+        p.error('--imagery is required unless --network-only is specified')
     if not (0 < args.near_spacing <= args.transition_spacing <= args.background_spacing):
         p.error('Require 0 < near-spacing <= transition-spacing <= background-spacing')
     if not (0 <= args.fine_buffer < args.transition_buffer):
@@ -355,6 +358,32 @@ def main():
         if dem.crs is None or not dem.crs.is_projected or 'met' not in (dem.crs.linear_units or '').lower():
             raise ValueError('DEM must use a projected CRS in meters')
         b = dem.bounds
+        if args.network_only:
+            lines, layers = load_lines(args.gpkg, args.layer, dem.crs)
+            # Match the normal terrain export origin and baseline without generating a mesh.
+            # Rasterio's masked minimum excludes NoData pixels.
+            if args.base_elevation is not None:
+                base = args.base_elevation
+            else:
+                minimum = None
+                for _, window in dem.block_windows(1):
+                    block = dem.read(1, window=window, masked=True)
+                    if block.count():
+                        value = float(block.min())
+                        minimum = value if minimum is None else min(minimum, value)
+                if minimum is None:
+                    raise ValueError('DEM contains no valid elevations')
+                base = minimum
+            export_lines(lines, dem, out, b.left, b.bottom, base,
+                         args.line_spacing, args.line_z_offset, not args.use_dem_line_z)
+            (out / 'georeference.json').write_text(json.dumps({
+                'crs': str(dem.crs), 'origin_x': b.left, 'origin_y': b.bottom,
+                'base_elevation': base, 'layers': layers,
+                'existing_line_z_preserved': not args.use_dem_line_z,
+                'network_only': True
+            }, indent=2), encoding='utf-8')
+            print(f'Done: network-only export at {out.resolve()}', flush=True)
+            return
         tree,layers,lines = read_corridors(args.gpkg,args.layer,dem.crs)
         corridor = None
         if args.corridor_only:
