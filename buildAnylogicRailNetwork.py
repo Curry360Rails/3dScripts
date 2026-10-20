@@ -1,68 +1,38 @@
-import math
 from anylogic_design_time_api import Workspace
-from anylogic_design_time_api.generated import RailTrack
+from anylogic_design_time_api.generated import RailTrack, RailroadSwitch
 
-TOKEN = 'd68e12ab-4988-447b-80b1-fe92bc82fc77'
-MODEL_NAME = "CEMEX_Victorville"
+ws = Workspace('d68e12ab-4988-447b-80b1-fe92bc82fc77')
+level = ws.getModel("CEMEX_Victorville").getAgent("Main").getLevel("level")
+network = level.getChild("railwayNetwork1")
 
-ws = Workspace(TOKEN)
-agent = ws.getModel(MODEL_NAME).getAgent("Main")
-level = agent.getLevel("level")
-yard = level.getChild("railwayNetwork")
+targets = {
+    "railwaySwitch91",
+    "railwaySwitch92",
+    "railwaySwitch93"
+}
 
-TARGETS = {"osmRail0161", "osmRail0163"}
-
-for network in level.getChildren():
-
-    if str(network.item.typeName()) != "Railyard":
+for element in network.getChildren():
+    if str(element.item.typeName()) != "RailroadSwitch":
         continue
 
-    print(f"\nNetwork: {network.getName()}")
+    sw = RailroadSwitch(element.pyWorkspace, element.item)
 
-    for element in network.getChildren():
+    if sw.getName() not in targets:
+        continue
 
-        if str(element.item.typeName()) != "RailTrack":
-            continue
+    print("\nSWITCH:", sw.getName())
+    print("Position:", sw.getX(), sw.getY(), sw.getZ())
+    print("Type:", sw.getType())
 
-        track = RailTrack(element.pyWorkspace, element.item)
-        name = track.getName()
+    for label, getter in (
+        ("Incoming", sw.getIncomingConnections),
+        ("Outgoing", sw.getOutgoingConnections)
+    ):
+        try:
+            connections = getter()
+            print(label, len(connections))
 
-        if name not in TARGETS:
-            continue
-
-        print(f"\nFOUND: {name}")
-        print("Network:", network.getName())
-        print("Position:", track.getX(), track.getY(), track.getZ())
-
-        raw = track.getPointList()
-        pts = [
-            tuple(raw[i:i+3])
-            for i in range(0, len(raw), 3)
-        ]
-
-        print("Point count:", len(pts))
-
-        for i, p in enumerate(pts):
-            if i == 0:
-                print(i, p)
-            else:
-                print(
-                    i, p,
-                    "XY length:",
-                    math.dist(pts[i-1][:2], p[:2]),
-                    "3D length:",
-                    math.dist(pts[i-1], p)
-                )
-
-        for label, getter in (
-            ("Source", track.getSource),
-            ("Target", track.getTarget)
-        ):
-            try:
-                connected = getter()
-                print(
-                    label,
-                    connected.getName() if connected else None
-                )
-            except Exception as e:
-                print(label, "ERROR:", e)
+            for c in connections:
+                print("  ", c.getName(), c.item.typeName())
+        except Exception as exc:
+            print(label, "ERROR:", exc)
