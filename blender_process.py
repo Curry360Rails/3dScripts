@@ -10,8 +10,8 @@ subprocess.run([
     "--factory-startup",
     "--python", str(Path("blender_terrain_to_glb.py").resolve()),
     "--",
-    "--input", r"testObjs\terrain.obj",
-    "--output", r"testObjs\terrain.glb",
+    "--input", r"terrain_output\terrain.obj",
+    "--output", r"terrain_output\terrain.glb",
     "--ratio", "0.5",
     "--merge-distance", "0.0001",
 ], check=True)

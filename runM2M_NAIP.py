@@ -10,6 +10,8 @@ import json
 import os
 import re
 import time
+import zipfile
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -174,7 +176,44 @@ def filename_from_response(response, url, number):
     return name if name and name not in ('.', '/') else f'naip_download_{number}.zip'
 
 
-def download_one(job, output, overwrite):
+def extract_and_remove_zip(archive):
+    """Extract into a folder named after the archive; delete ZIP only on success."""
+    archive = Path(archive)
+    target = archive.parent / archive.stem
+    temp_target = archive.parent / (archive.stem + '.extracting')
+    if temp_target.exists():
+        shutil.rmtree(temp_target)
+    temp_target.mkdir(parents=True)
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            members = zf.infolist()
+            if not members:
+                raise ValueError(f'Empty ZIP archive: {archive.name}')
+            root = temp_target.resolve()
+            for member in members:
+                # Reject absolute paths, traversal, and unsafe links.
+                member_path = (temp_target / member.filename).resolve()
+                if not member_path.is_relative_to(root):
+                    raise ValueError(f'Unsafe ZIP member: {member.filename}')
+                if (member.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise ValueError(f'Symlink in ZIP: {member.filename}')
+            bad = zf.testzip()
+            if bad is not None:
+                raise ValueError(f'Corrupt ZIP member: {bad}')
+            zf.extractall(temp_target)
+        if target.exists():
+            # Avoid silently overwriting an existing extracted dataset.
+            raise FileExistsError(f'Extraction destination already exists: {target}')
+        temp_target.rename(target)
+        archive.unlink()
+        return target
+    except Exception:
+        if temp_target.exists():
+            shutil.rmtree(temp_target)
+        raise
+
+
+def download_one(job, output, overwrite, extract_zips=True):
     number, url = job
     for attempt in range(3):
         try:
@@ -183,6 +222,9 @@ def download_one(job, output, overwrite):
                 name = filename_from_response(response, url, number)
                 dest = output / name
                 if dest.exists() and dest.stat().st_size > 0 and not overwrite:
+                    if extract_zips and dest.suffix.lower() == '.zip':
+                        extracted = extract_and_remove_zip(dest)
+                        return ('extracted', str(extracted))
                     return ('skipped', str(dest))
                 temp = output / (name + '.part')
                 with temp.open('wb') as file:
@@ -193,8 +235,11 @@ def download_one(job, output, overwrite):
                 if expected and temp.stat().st_size != int(expected):
                     raise IOError(f'Incomplete download: {name}')
                 temp.replace(dest)
+                if extract_zips and dest.suffix.lower() == '.zip':
+                    extracted = extract_and_remove_zip(dest)
+                    return ('extracted', str(extracted))
                 return ('downloaded', str(dest))
-        except (requests.RequestException, OSError, ValueError) as exc:
+        except (requests.RequestException, OSError, ValueError, zipfile.BadZipFile) as exc:
             if attempt == 2:
                 return ('failed', f'{url}: {exc}')
             time.sleep(2 ** attempt)
@@ -216,6 +261,7 @@ def main():
     p.add_argument('--poll-attempts', type=int, default=12)
     p.add_argument('--request-batch', type=int, default=100)
     p.add_argument('--overwrite', action='store_true')
+    p.add_argument('--keep-zips', action='store_true', help='Keep ZIP files without extracting (default: extract and delete after success)')
     p.add_argument('--list-only', action='store_true', help='List selected latest downloadable scenes; do not request files')
     args = p.parse_args()
     if not args.username or not args.token:
@@ -255,9 +301,9 @@ def main():
             return
         urls = gather_urls(session,args.dataset,selected,args.poll_seconds,args.poll_attempts,args.request_batch)
         print(f'Received {len(urls)} unique download URLs for {len(selected)} selected tiles')
-        counts = {'downloaded':0,'skipped':0,'failed':0}
+        counts = {'downloaded':0,'extracted':0,'skipped':0,'failed':0}
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = [pool.submit(download_one,(i,url),args.output,args.overwrite) for i,url in enumerate(urls,1)]
+            futures = [pool.submit(download_one,(i,url),args.output,args.overwrite,not args.keep_zips) for i,url in enumerate(urls,1)]
             for future in as_completed(futures):
                 status, detail = future.result()
                 counts[status] += 1

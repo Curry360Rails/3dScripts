@@ -15,7 +15,7 @@ def args_parse():
     p.add_argument('--input', required=True, help='Path to textured terrain OBJ')
     p.add_argument('--output', required=True, help='Destination GLB')
     p.add_argument('--merge-distance', type=float, default=0.0001)
-    p.add_argument('--ratio', type=float, default=0.5, help='Collapse decimation ratio (1 = no decimation)')
+    p.add_argument('--ratio', type=float, default=0.01, help='Collapse decimation ratio (1 = no decimation)')
     p.add_argument('--no-merge', action='store_true')
     p.add_argument('--no-join', action='store_true')
     return p.parse_args(argv)
