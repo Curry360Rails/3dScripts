@@ -41,12 +41,12 @@ def densify(line, spacing):
 
 def export_lines(gpkg_path, layers, dem, out, origin_x, origin_y, base, spacing, z_offset):
     try:
-        import fiona
+        import pyogrio
     except ImportError as exc:
-        raise RuntimeError('GeoPackage support requires Fiona: pip install fiona') from exc
+        raise RuntimeError('GeoPackage support requires Pyogrio: pip install pyogrio') from exc
     if not Path(gpkg_path).is_file():
         raise FileNotFoundError(gpkg_path)
-    available = fiona.listlayers(gpkg_path)
+    available = pyogrio.list_layers(gpkg_path)[:, 0].tolist()
     selected = layers or available
     missing = sorted(set(selected) - set(available))
     if missing:
@@ -57,35 +57,39 @@ def export_lines(gpkg_path, layers, dem, out, origin_x, origin_y, base, spacing,
         obj.write('# Elevated polylines; edges only, no faces\n')
         index = 1
         for layer in selected:
-            with fiona.open(gpkg_path, layer=layer) as src:
-                if not src.crs_wkt and not src.crs:
-                    raise ValueError(f'Layer {layer!r} has no CRS')
-                source_crs = src.crs_wkt or src.crs
-                obj.write(f'o {layer.replace(" ", "_")}\n')
-                for feature in src:
-                    geom = feature.get('geometry')
-                    if geom is None:
+            from shapely.geometry import mapping
+            from shapely import from_wkb
+            info = pyogrio.read_info(gpkg_path, layer=layer)
+            source_crs = info.get('crs')
+            if not source_crs:
+                raise ValueError(f'Layer {layer!r} has no CRS')
+            # read_geometry=True returns WKB geometry with no GeoPandas dependency.
+            meta, table = pyogrio.read_arrow(gpkg_path, layer=layer, columns=[], read_geometry=True)
+            geometry_column = meta['geometry_name']
+            obj.write(f'o {layer.replace(" ", "_")}\n')
+            for wkb in table[geometry_column].to_pylist():
+                if wkb is None:
+                    continue
+                geom = transform_geom(source_crs, dem.crs, mapping(from_wkb(wkb)))
+                for segment in segments(geom):
+                    coords = list(densify(segment, spacing))
+                    if len(coords) < 2:
                         continue
-                    geom = transform_geom(source_crs, dem.crs, dict(geom))
-                    for segment in segments(geom):
-                        coords = list(densify(segment, spacing))
-                        if len(coords) < 2:
+                    elevations = list(dem.sample(coords, indexes=1, masked=True))
+                    chain = []
+                    for (x, y), sample in zip(coords, elevations):
+                        z = sample[0]
+                        if np.ma.is_masked(z) or not np.isfinite(z) or (dem.nodata is not None and z == dem.nodata):
+                            if len(chain) > 1:
+                                obj.write('l ' + ' '.join(map(str, chain)) + '\n')
+                            chain = []
                             continue
-                        elevations = list(dem.sample(coords, indexes=1, masked=True))
-                        chain = []
-                        for (x, y), sample in zip(coords, elevations):
-                            z = sample[0]
-                            if np.ma.is_masked(z) or not np.isfinite(z) or (dem.nodata is not None and z == dem.nodata):
-                                if len(chain) > 1:
-                                    obj.write('l ' + ' '.join(map(str, chain)) + '\n')
-                                chain = []
-                                continue
-                            obj.write(f'v {x-origin_x:.4f} {y-origin_y:.4f} {float(z)-base+z_offset:.4f}\n')
-                            chain.append(index)
-                            index += 1
-                            count += 1
-                        if len(chain) > 1:
-                            obj.write('l ' + ' '.join(map(str, chain)) + '\n')
+                        obj.write(f'v {x-origin_x:.4f} {y-origin_y:.4f} {float(z)-base+z_offset:.4f}\n')
+                        chain.append(index)
+                        index += 1
+                        count += 1
+                    if len(chain) > 1:
+                        obj.write('l ' + ' '.join(map(str, chain)) + '\n')
     print(f'Created {obj_path} ({count:,} elevated polyline vertices; layers: {selected})')
     return selected
 
