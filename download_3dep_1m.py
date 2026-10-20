@@ -5,6 +5,7 @@ Coordinates are WGS84 longitude,latitude decimal degrees. Searches product footp
 intersecting the polygon; does not crop source DEMs to the polygon.
 """
 import argparse
+from datetime import date
 import json
 import re
 import sys
@@ -80,6 +81,12 @@ def get_products(s, pts, args):
         base['bbox'] = f'{west:.9f},{south:.9f},{east:.9f},{north:.9f}'
     if args.geotiff_only:
         base['prodFormats'] = 'GeoTIFF'
+    if args.start_date or args.end_date:
+        base['dateType'] = args.date_type
+        if args.start_date:
+            base['start'] = args.start_date
+        if args.end_date:
+            base['end'] = args.end_date
     found = []
     offset = 0
     while True:
@@ -157,6 +164,10 @@ def main():
     p.add_argument('--output', default='3dep_1m_downloads')
     p.add_argument('--bbox-only', action='store_true', help='Search polygon bounding box instead')
     p.add_argument('--geotiff-only', action='store_true', help='Filter product format to GeoTIFF (may exclude IMG or ZIP products)')
+    p.add_argument('--start-date', help='Inclusive date filter start (YYYY-MM-DD)')
+    p.add_argument('--end-date', help='Inclusive date filter end (YYYY-MM-DD)')
+    p.add_argument('--date-type', choices=['Publication', 'dateCreated', 'lastUpdated'],
+                   default='Publication', help='Product metadata date field (default: Publication)')
     p.add_argument('--page-size', type=int, default=100)
     p.add_argument('--max-results', type=int, default=10000)
     p.add_argument('--download', action='store_true', help='Download products (default: search and save manifest only)')
@@ -165,6 +176,18 @@ def main():
     args = p.parse_args()
     if args.page_size < 1 or args.max_results < 1:
         p.error('page-size and max-results must be positive')
+    if args.start_date and not args.end_date:
+        p.error('--end-date is required when --start-date is supplied')
+    for flag, value in (('--start-date', args.start_date), ('--end-date', args.end_date)):
+        if value:
+            try:
+                parsed = date.fromisoformat(value)
+                if parsed.isoformat() != value:
+                    raise ValueError()
+            except ValueError:
+                p.error(f'{flag} must be a valid date in YYYY-MM-DD format')
+    if args.start_date and args.end_date and args.start_date > args.end_date:
+        p.error('--start-date must not be later than --end-date')
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     try:
@@ -172,10 +195,10 @@ def main():
         session = session_with_retries()
         products = get_products(session, pts, args)
         manifest = out / 'products.json'
-        manifest.write_text(json.dumps({'dataset': DATASET, 'polygon_lon_lat': pts, 'items': products}, indent=2), encoding='utf-8')
+        manifest.write_text(json.dumps({'dataset': DATASET, 'polygon_lon_lat': pts, 'date_filter': {'type': args.date_type, 'start': args.start_date, 'end': args.end_date}, 'items': products}, indent=2), encoding='utf-8')
         print(f'Found {len(products)} downloadable products; manifest: {manifest}')
         for i, item in enumerate(products, 1):
-            print(f'  {i:3}. {item.get("title", "Untitled")} | {item.get("downloadURL", "")}')
+            print(f'  {i:3}. {item.get("title", "Untitled")} | published: {item.get("publicationDate", "unknown")} | {item.get("downloadURL", "")}')
         if not args.download:
             print('Search-only mode. Add --download to fetch products.')
             return
