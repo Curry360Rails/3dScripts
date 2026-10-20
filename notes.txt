@@ -1,0 +1,32 @@
+System.Windows.Controls.TextBlock	Minimum	Maximum	Mean	Std. Deviation
+Band_1	786.7772216796875	1257.1817626953125	912.2410600920355	87.57345483178875
+
+
+gdalwarp -s_srs EPSG:4269 -t_srs EPSG:4326 -r bilinear -co COMPRESS=DEFLATE -co PREDICTOR=2 -co TILED=YES input_nad83.tif output_wgs84.tif
+
+can't parse JSON.  Raw result:
+
+{errorMessage=[BadRequest] 'list index out of range' , errorType=Exception, requestId=733ff4c4-7a2f-4ee8-a08b-a8d6f5e5ce65, stackTrace=["  File \"\/var\/task\/get_products.py\", line 56, in lambda_handler\n    raise Exception(\"[BadRequest] '{}' \".format(e.args[0]))\n"]}
+
+
+python build_terrain.py --dem "victorville_raster.tif - Shortcut" --imagery "merged imagery.tif - Shortcut" --spacing 10 --output "terrain_output"
+
+python build_terrain.py --dem "..\usgs 1m DEM tifs\combined raster\victorville_raster.tif" --imagery "..\projectsatellite.tif" --gpkg "..\project\railAlignment3D.gpkg" --spacing 10 --line-spacing 2 --output "..\project\merged imagery.tif"
+
+
+python adaptive_mesh.py --dem "..\usgs 1m DEM tifs\combined raster\victorville_raster.tif" --imagery "..\project\merged imagery.tif" --gpkg "railAlignmentExploded.gpkg" --spacing 100 --line-spacing 2 --output "terrain_output_v3.tif"
+
+python adaptive_mesh.py --dem "..\usgs 1m DEM tifs\combined raster\victorville_raster.tif" --imagery "..\project\merged imagery.tif" --gpkg "railAlignmentExploded.gpkg" --near-spacing 3 --transition-spacing 10 --background-spacing 70 --fine-buffer 25 --transition-buffer 200 --output "adaptive_terrainv1"
+
+
+python adaptive_terrain_fixed.py --dem "..\usgs 1m DEM tifs\combined raster\victorville_raster.tif" --imagery "..\project\merged imagery.tif" --gpkg "railAlignmentExploded.gpkg" --near-spacing 3 --transition-spacing 10 --background-spacing 70 --fine-buffer 50 --transition-buffer 200 --line-z-offset 0 --output "adaptive_terrainv2"
+
+
+
+python adaptive_terrain_corridor.py --dem "..\usgs 1m DEM tifs\combined raster\victorville_raster.tif" --imagery "..\project\merged imagery.tif" --gpkg "railAlignmentExploded.gpkg" --corridor-only --corridor-width 200 --near-spacing 3 --transition-spacing 10 --background-spacing 70 --fine-buffer 50 --transition-buffer 200 --texture-resolution 0.25 --texture-tile-size 2048 --line-z-offset 0 --output "corridor_terrain"
+
+python adaptive_terrain_parallel.py --dem "..\usgs 1m DEM tifs\combined raster\victorville_raster.tif" --imagery "..\project\merged imagery.tif" --gpkg "railAlignmentExploded.gpkg" --corridor-only --corridor-width 200 --near-spacing 3 --transition-spacing 10 --background-spacing 70 --fine-buffer 50 --transition-buffer 200 --texture-resolution 1 --texture-tile-size 2048 --line-z-offset 0 --workers 8 --output "corridor_parallel"
+
+python adaptive_terrain_parallel_network_only.py  --dem "..\usgs 1m DEM tifs\combined raster\victorville_raster.tif" --gpkg "railAlignment3D.gpkg" --network-only --line-spacing 3 --line-z-offset 0 --output "network_output"
+
+python adaptive_terrain_parallel_exact_network.py --dem "..\usgs 1m DEM tifs\combined raster\victorville_raster.tif" --gpkg "railAlignment3D.gpkg" --network-only --output "network_only_exact_output"

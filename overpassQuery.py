@@ -84,7 +84,13 @@ poly_string = " ".join(
     f"{point['lat']} {point['lng']}" for point in polygon
 )
 
+url = "https://overpass-api.de/api/interpreter"
 
+headers = {
+    "User-Agent": "VictorvilleRailOSMExtractor/1.0 (contact: currybuscher@gmail.com)",
+    "Accept": "application/json",
+    "Accept-Encoding": "gzip, deflate",
+}
 
 query = f"""
 [out:json][timeout:180];
@@ -98,13 +104,20 @@ out skel qt;
 """
 
 response = requests.post(
-    "https://overpass-api.de/api/interpreter",
+    url,
     data={"data": query},
+    headers=headers,
     timeout=240
 )
+print("HTTP status:", response.status_code)
 
-response.raise_for_status()
+if response.status_code != 200:
+    print("Server response:")
+    print(response.text[:3000])
+    response.raise_for_status()
 data = response.json()
 
 with open("railway_raw_osm.json", "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
+
+print(f"Downloaded {len(data['elements']):,} OSM elements")
