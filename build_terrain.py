@@ -3,6 +3,9 @@ import argparse
 import bisect
 import json
 import math
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor
 from collections import defaultdict
 from pathlib import Path
 
@@ -178,49 +181,94 @@ def polygon_parts(geom):
             yield from polygon_parts(g)
 
 
-def export_corridor_tiled(out, dem, imagery_path, bounds, keys, elevations, valid,
-                          faces, step, base, corridor, resolution, tile_pixels):
-    """Clip terrain triangles to a single corridor and tile boundaries; per-tile UVs."""
-    from shapely.prepared import prep
-    from collections import defaultdict
-    b = bounds
-    tile_m = resolution * tile_pixels
-    x0, y0 = b.left, b.bottom
-    prepared = prep(corridor)
-    xy = [(min(b.right, x0 + ix * step), min(b.top, y0 + iy * step)) for ix,iy in keys]
-    # Store clipped polygons by tile; no giant full-extent texture.
-    tile_polygons = defaultdict(list)
-    for a,c,d in tqdm(faces, desc='Clipping terrain to corridor and tiles', unit='face'):
+# Workers receive immutable mesh data once, not with every task.
+_WORK = {}
+
+
+def _init_clip_worker(xy, valid, corridor_wkb, x0, y0, tile_m, xmax, ymax):
+    from shapely import from_wkb, prepare
+    corridor = from_wkb(corridor_wkb)
+    prepare(corridor)
+    _WORK.clear()
+    _WORK.update(xy=xy, valid=valid, corridor=corridor,
+                 x0=x0, y0=y0, tile_m=tile_m, xmax=xmax, ymax=ymax)
+
+
+def _clip_batch(batch):
+    from shapely.geometry import Polygon, box
+    w = _WORK
+    xy, valid, corridor = w['xy'], w['valid'], w['corridor']
+    x0, y0, tile_m = w['x0'], w['y0'], w['tile_m']
+    xmax, ymax = w['xmax'], w['ymax']
+    results = defaultdict(list)
+    tile_boxes = {}
+    for a, c, d in batch:
         if not (valid[a-1] and valid[c-1] and valid[d-1]):
             continue
-        tri = Polygon([xy[a-1],xy[c-1],xy[d-1]])
-        if tri.area < 1e-10 or not prepared.intersects(tri):
+        tri = Polygon((xy[a-1], xy[c-1], xy[d-1]))
+        if tri.area < 1e-10 or not corridor.intersects(tri):
             continue
-        clipped = tri.intersection(corridor)
-        for poly in polygon_parts(clipped):
-            minx,miny,maxx,maxy = poly.bounds
+        # Most triangles inside the corridor need NO polygon intersection.
+        parts = (tri,) if corridor.covers(tri) else tuple(polygon_parts(tri.intersection(corridor)))
+        for poly in parts:
+            minx, miny, maxx, maxy = poly.bounds
             ix0 = max(0, math.floor((minx-x0)/tile_m))
             iy0 = max(0, math.floor((miny-y0)/tile_m))
-            ix1 = math.floor((maxx-x0)/tile_m)
-            iy1 = math.floor((maxy-y0)/tile_m)
+            ix1 = min(math.ceil((xmax-x0)/tile_m)-1, math.floor((maxx-x0-1e-9)/tile_m))
+            iy1 = min(math.ceil((ymax-y0)/tile_m)-1, math.floor((maxy-y0-1e-9)/tile_m))
+            if ix0 == ix1 and iy0 == iy1:
+                results[(ix0,iy0)].append((poly,(a,c,d)))
+                continue
             for iy in range(iy0,iy1+1):
                 for ix in range(ix0,ix1+1):
-                    tx0,ty0 = x0+ix*tile_m,y0+iy*tile_m
-                    piece = poly.intersection(box(tx0,ty0,tx0+tile_m,ty0+tile_m))
+                    key=(ix,iy)
+                    if key not in tile_boxes:
+                        tile_boxes[key]=box(x0+ix*tile_m,y0+iy*tile_m,
+                                            min(x0+(ix+1)*tile_m,xmax),
+                                            min(y0+(iy+1)*tile_m,ymax))
+                    tile=tile_boxes[key]
+                    piece=poly if tile.covers(poly) else poly.intersection(tile)
                     for part in polygon_parts(piece):
-                        tile_polygons[(ix,iy)].append((part,(a,c,d)))
+                        results[key].append((part,(a,c,d)))
+    return results
+
+
+def export_corridor_tiled(out, dem, imagery_path, bounds, keys, elevations, valid,
+                          faces, step, base, corridor, resolution, tile_pixels,
+                          workers=1, clip_batch_size=4000):
+    """Clip faces in batches; avoid intersections for interior faces; parallel on request."""
+    from shapely import to_wkb
+    b=bounds
+    tile_m=resolution*tile_pixels
+    x0,y0=b.left,b.bottom
+    xy=[(min(b.right,x0+ix*step),min(b.top,y0+iy*step)) for ix,iy in keys]
+    tile_polygons=defaultdict(list)
+    batches=(faces[i:i+clip_batch_size] for i in range(0,len(faces),clip_batch_size))
+    total=math.ceil(len(faces)/clip_batch_size)
+    start=time.perf_counter()
+    init=(xy,valid,to_wkb(corridor),x0,y0,tile_m,b.right,b.top)
+    if workers == 1:
+        _init_clip_worker(*init)
+        iterator=map(_clip_batch,batches)
+        for result in tqdm(iterator,total=total,desc='Clipping terrain batches',unit='batch'):
+            for key,items in result.items(): tile_polygons[key].extend(items)
+    else:
+        # Windows uses spawn: top-level functions and __main__ guard are required.
+        with ProcessPoolExecutor(max_workers=workers,initializer=_init_clip_worker,initargs=init) as pool:
+            iterator=pool.map(_clip_batch,batches,chunksize=1)
+            for result in tqdm(iterator,total=total,desc='Clipping terrain batches',unit='batch'):
+                for key,items in result.items(): tile_polygons[key].extend(items)
+    print(f'Clipping completed in {time.perf_counter()-start:.1f}s using {workers} worker(s)',flush=True)
     if not tile_polygons:
         raise ValueError('No valid corridor terrain faces. Check DEM coverage and corridor location.')
-    # A per-tile OBJ object and material. Geometry is globally positioned and all
-    # vertices are written once per tile, using tile-local UVs.
-    textures = out/'textures'; textures.mkdir(exist_ok=True)
-    material_lines = []
-    vertex_index = 0
+    textures=out/'textures'; textures.mkdir(exist_ok=True)
+    material_lines=[]
+    vertex_index=0
     with rasterio.open(imagery_path) as imagery:
         if imagery.crs is None: raise ValueError('Imagery has no CRS')
-        with (out/'terrain.obj').open('w',encoding='utf8') as obj:
+        with (out/'terrain.obj').open('w',encoding='utf8',buffering=1024*1024) as obj:
             obj.write('mtllib terrain.mtl\n')
-            for (ix,iy), pieces in tqdm(sorted(tile_polygons.items()), desc='Exporting texture tiles', unit='tile'):
+            for (ix,iy),pieces in tqdm(sorted(tile_polygons.items()),desc='Exporting texture tiles',unit='tile'):
                 tx0,ty0=x0+ix*tile_m,y0+iy*tile_m
                 tx1,ty1=min(tx0+tile_m,b.right),min(ty0+tile_m,b.top)
                 w=max(2,math.ceil((tx1-tx0)/resolution))
@@ -238,15 +286,18 @@ def export_corridor_tiled(out, dem, imagery_path, bounds, keys, elevations, vali
                 mat=f'Corridor_{ix}_{iy}'
                 material_lines.append(f'newmtl {mat}\nKd 1 1 1\nmap_Kd textures/{texname}\n')
                 obj.write(f'o Tile_{ix}_{iy}\nusemtl {mat}\n')
-                # Barycentric interpolation of elevations preserves the original
-                # triangle surface at clipped vertices and texture tile edges.
-                for part, ids in pieces:
+                for part,ids in pieces:
                     a,c,d=ids
-                    xA,yA=xy[a-1]; xB,yB=xy[c-1]; xC,yC=xy[d-1]
+                    xA,yA=xy[a-1];xB,yB=xy[c-1];xC,yC=xy[d-1]
                     denom=(yB-yC)*(xA-xC)+(xC-xB)*(yA-yC)
-                    if abs(denom)<1e-12: continue
-                    for triangle in constrained_delaunay_triangles(part).geoms:
-                        if triangle.area<1e-10: continue
+                    if abs(denom)<1e-12:continue
+                    # Already-triangular polygons can be exported directly.
+                    if len(part.interiors)==0 and len(part.exterior.coords)==4:
+                        triangles=(part,)
+                    else:
+                        triangles=constrained_delaunay_triangles(part).geoms
+                    for triangle in triangles:
+                        if triangle.area<1e-10:continue
                         coords=list(triangle.exterior.coords)[:3]
                         for x,y in coords:
                             wa=((yB-yC)*(x-xC)+(xC-xB)*(y-yC))/denom
@@ -281,6 +332,8 @@ def main():
     p.add_argument('--max-cells', type=int, default=2_000_000)
     p.add_argument('--max-texture', type=int, default=8192)
     p.add_argument('--base-elevation', type=float)
+    p.add_argument('--workers', type=int, default=8, help='Clipping worker processes (1 disables multiprocessing)')
+    p.add_argument('--clip-batch-size', type=int, default=4000)
     p.add_argument('--corridor-only', action='store_true', help='Export only terrain inside the rail corridor buffer')
     p.add_argument('--corridor-width', type=float, default=400, help='Total corridor width in meters')
     p.add_argument('--texture-resolution', type=float, default=0.5, help='Texture meters per pixel in corridor mode')
@@ -293,6 +346,8 @@ def main():
         p.error('Require 0 <= fine-buffer < transition-buffer')
     if args.max_texture < 2 or args.line_spacing <= 0 or args.max_cells <= 0:
         p.error('Invalid max-texture, line-spacing or max-cells')
+    if args.workers < 1 or args.clip_batch_size < 1:
+        p.error('workers and clip-batch-size must be positive')
     if args.corridor_width <= 0 or args.texture_resolution <= 0 or args.texture_tile_size < 2:
         p.error('Corridor width, texture resolution and texture tile size must be positive')
     out = Path(args.output); out.mkdir(parents=True,exist_ok=True)
@@ -343,7 +398,7 @@ def main():
         if args.corridor_only:
             stats = export_corridor_tiled(out, dem, args.imagery, b, keys, elevations, valid, faces,
                                           step, base, corridor, args.texture_resolution,
-                                          args.texture_tile_size)
+                                          args.texture_tile_size, args.workers, args.clip_batch_size)
             tw = th = 0
         else:
             with rasterio.open(args.imagery) as imagery:
@@ -386,7 +441,8 @@ def main():
             'existing_line_z_preserved':not args.use_dem_line_z,
             'corridor_only':args.corridor_only, 'corridor_width_m':args.corridor_width,
             'texture_resolution_m_per_pixel':args.texture_resolution,
-            'texture_tile_max_pixels':args.texture_tile_size
+            'texture_tile_max_pixels':args.texture_tile_size,
+            'clip_workers':args.workers
         },indent=2))
         print(f'Done: {out.resolve()} | source mesh {len(vertices):,} vertices, {len(faces):,} triangles' + (' | corridor tiles: '+str(stats['tiles']) if args.corridor_only else f' | texture {tw}x{th}'))
 
