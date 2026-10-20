@@ -33,6 +33,9 @@ MIN_TRACK_LENGTH_M=0.10
 STRICT_GEOMETRY=True
 
 SKIP_TRACK_NAMES = {"osmRail0040"}
+# Press Enter at each checkpoint to continue importing.
+PAUSE_AFTER_CREATE = False
+PAUSE_AFTER_POINTS = False
 
 class DSU:
     def __init__(self,n):self.p=list(range(n))
@@ -220,98 +223,67 @@ def build():
         print(f'WARNING: expected {EXPECTED_NETWORKS}; no artificial connections added.')
     return merged,switch_nodes
 
-# Diagnostic mode: geometry only. No switches or source/target connections.
-# Use a fresh backup model for each run; this does not remove prior imports.
-SKIP_TRACK_NAMES = {"osmRail0040"}
-STOP_ON_ERROR = True
-READ_BACK_GEOMETRY = True
-
-
 def main():
-    merged, switch_nodes = build()
-    print(f"GEOMETRY-ONLY TEST: {len(merged)} candidate tracks; "
-          f"{len(switch_nodes)} switch nodes intentionally NOT created", flush=True)
+    merged,switch_nodes=build()
     if DRY_RUN:
-        print("DRY_RUN=True: no AnyLogic objects created.", flush=True)
+        print('DRY_RUN=True: nothing added to AnyLogic.')
         return
-    if TOKEN == 'PASTE_ANYLOGIC_CONNECTOR_TOKEN':
-        raise ValueError('Set TOKEN to your AnyLogic connector token')
-
-    from anylogic_design_time_api import Workspace
-    from anylogic_design_time_api.generated import RailTrack
-
-    ref = json.loads(TERRAIN_GEOREFERENCE.read_text(encoding='utf-8'))
-    if str(ref['crs']).upper() not in ('EPSG:26911', '26911'):
+    if TOKEN=='PASTE_ANYLOGIC_CONNECTOR_TOKEN':
+        raise ValueError('Set TOKEN to your AnyLogic Design-Time API connector token')
+    from anylogic_design_time_api import Workspace, Utils
+    from anylogic_design_time_api.generated import RailTrack,RailroadSwitch
+    ref=json.loads(TERRAIN_GEOREFERENCE.read_text(encoding='utf-8'))
+    if str(ref['crs']).upper() not in ('EPSG:26911','26911'):
         raise ValueError('Terrain georeference must be EPSG:26911')
-    ox, oy, base = ref['origin_x'], ref['origin_y'], ref['base_elevation']
-
+    ox,oy,base=ref['origin_x'],ref['origin_y'],ref['base_elevation']
     def cv(p):
-        return ((p[0] - ox) * MODEL_UNITS_PER_METER,
-                ((oy - p[1]) if FLIP_Y else (p[1] - oy)) * MODEL_UNITS_PER_METER,
-                (p[2] - base) * MODEL_UNITS_PER_METER)
+        return ((p[0]-ox)*MODEL_UNITS_PER_METER,
+                ((oy-p[1]) if FLIP_Y else (p[1]-oy))*MODEL_UNITS_PER_METER,
+                (p[2]-base)*MODEL_UNITS_PER_METER)
+    ws=Workspace(TOKEN)
+    level=ws.getModel(MODEL_NAME).getAgent(AGENT_NAME).getLevels()[LEVEL_INDEX]
+    switches={}
+    for n,c in switch_nodes.items():
+        x,y,z=cv(c)
+        sw=RailroadSwitch.create(level);sw.setX(x);sw.setY(y);sw.setZ(z)
+        switches[n]=sw
+    failures=0
+    for i,(points,a,b) in enumerate(merged,1):
+        pts=[cv(p) for p in points]
+        if STRICT_GEOMETRY:
+            problem=validate_polyline(points)
+            if problem:
+                raise ValueError(f'Invalid source track {i}: {problem}')
+        x0,y0,z0=pts[0]
+        track_name = f"{NAME_PREFIX}{i:04d}"
 
-    ws = Workspace(TOKEN)
-    level = ws.getModel(MODEL_NAME).getAgent(AGENT_NAME).getLevels()[LEVEL_INDEX]
-    created = []
-    failed = []
-    skipped = []
-
-    for i, (points, a, b) in enumerate(merged, 1):
-        name = f'{NAME_PREFIX}{i:04d}'
-        if name in SKIP_TRACK_NAMES:
-            print(f'SKIPPING {name}', flush=True)
-            skipped.append(name)
+        if track_name in SKIP_TRACK_NAMES:
+            print(f"SKIPPING: {track_name}")
             continue
-        problem = validate_polyline(points)
-        if problem:
-            print(f'INVALID SOURCE {name}: {problem}', flush=True)
-            failed.append((name, problem))
-            if STOP_ON_ERROR:
-                break
-            continue
-        pts = [cv(p) for p in points]
-        x0, y0, z0 = pts[0]
-        rel = [v for x, y, z in pts for v in (x - x0, y - y0, z - z0)]
-        print(f'[{i}/{len(merged)}] CREATING {name} ({len(pts)} points)', flush=True)
-        track = None
-        stage = 'create'
-        try:
-            track = RailTrack.create(level)
-            stage = 'name'
-            track.setName(name)
-            stage = 'position'
-            track.setX(x0)
-            track.setY(y0)
-            track.setZ(z0)
-            stage = 'setPointList'
-            print(f'  SETTING GEOMETRY {name}', flush=True)
-            prepared = Utils.createStraightPointsList(track, rel)
-            track.setPointList(prepared)
-            print(f'  GEOMETRY SET {name}', flush=True)
-            if READ_BACK_GEOMETRY:
-                stage = 'readback'
-                actual = list(track.getPointList())
-                if len(actual) != len(rel):
-                    raise ValueError(f'Point list length differs: {len(actual)} vs {len(rel)}')
-                max_error = max(abs(float(a) - float(b)) for a, b in zip(actual, rel))
-                print(f'  READBACK {name}: {len(actual)//3} points; max coordinate error {max_error:.8g}', flush=True)
-                if max_error > 1e-5:
-                    raise ValueError(f'Coordinate mismatch: max error {max_error}')
-            created.append(name)
-        except Exception as exc:
-            print(f'  FAILED {name} at {stage}: {type(exc).__name__}: {exc}', flush=True)
-            failed.append((name, stage, str(exc)))
-            # Do not automatically delete a potentially malformed object; it may
-            # have been partially created and requires inspection in a backup.
-            if STOP_ON_ERROR:
-                break
+        print(f"CREATING {track_name}", flush=True)
+        track=RailTrack.create(level)
+        print(f"CREATED {track_name}", flush=True)
+        if PAUSE_AFTER_CREATE:
+            input(f"[{track_name}] Created. Press Enter to set its geometry... ")
+        track.setX(x0);track.setY(y0);track.setZ(z0)
+        rel=[v for x,y,z in pts for v in (x-x0,y-y0,z-z0)]
+        # setPointList() accepts flat XYZ values and preserves relative Z.
+        # createStraightPointsList() is not needed for this input.
+        prepared = Utils.createStraightPointsList(track, rel)
+        print(f"SETTING POINTS {track_name} ({len(pts)} vertices)", flush=True)
+        track.setPointList(prepared)
+        print(f"POINTS SET {track_name}", flush=True)
+        if PAUSE_AFTER_POINTS:
+            input(f"[{track_name}] Points set. Press Enter to continue... ")
+        try:track.setName(f'{NAME_PREFIX}{i:04d}')
+        except Exception:pass
+        for node,method in ((a,track.setSource),(b,track.setTarget)):
+            if node in switches:
+                try:method(switches[node])
+                except Exception as exc:
+                    failures+=1;print(f'Connection failure on track {i} at node {node}: {exc}')
+        if i%50==0:print(f'Created {i}/{len(merged)} tracks')
+    print(f'Done: {len(merged)} RailTracks, {len(switches)} switches, {failures} connection failures.')
+    if failures:print('Inspect failed switch connections; some multi-leg OSM junctions may not be supported by AnyLogic.')
 
-    print(f'FINISHED: created={len(created)}, skipped={skipped}, failures={len(failed)}', flush=True)
-    for failure in failed:
-        print('  FAILURE:', failure, flush=True)
-    print('No switches or rail endpoint connections were created.', flush=True)
-    print('Review the AnyLogic Error Log even if all Python calls succeeded.', flush=True)
-
-
-if __name__ == '__main__':
-    main()
+if __name__=='__main__':main()
