@@ -158,6 +158,94 @@ def load_lines(path, layers, target_crs, preserve_original_crs=False):
     return geometries, selected
 
 
+
+def load_vector_lines(path, layers, target_crs, preserve_original_crs=False):
+    """Read a single GPKG, Overpass JSON, GeoJSON, or KML vector source.
+
+    GeoJSON, Overpass JSON, and KML coordinates are WGS84 lon/lat.
+    Reproject X/Y into DEM CRS; preserve original vertex count and any Z.
+    """
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == '.gpkg':
+        return load_lines(str(path), layers, target_crs, preserve_original_crs)
+    if layers:
+        raise ValueError('--layer is supported only for GeoPackage inputs')
+    geometries = []
+    if suffix in ('.geojson', '.json'):
+        data = json.loads(path.read_text(encoding='utf-8-sig'))
+        if isinstance(data, dict) and isinstance(data.get('elements'), list):
+            # Overpass raw OSM JSON: ways reference shared OSM node IDs.
+            nodes = {e['id']: (e['lon'], e['lat']) for e in data['elements']
+                     if e.get('type') == 'node' and 'lon' in e and 'lat' in e}
+            missing = 0
+            for element in data['elements']:
+                if element.get('type') != 'way':
+                    continue
+                tags = element.get('tags', {})
+                if not (tags.get('railway') or tags.get('highway')):
+                    continue
+                coords = []
+                for node_id in element.get('nodes', []):
+                    if node_id not in nodes:
+                        missing += 1
+                        break
+                    coords.append(nodes[node_id])
+                else:
+                    if len(coords) >= 2:
+                        geometries.append(LineString(coords))
+            if missing:
+                print(f'WARNING: {missing} OSM ways have missing referenced nodes; skipped.', flush=True)
+        else:
+            features = data.get('features', []) if data.get('type') == 'FeatureCollection' else [data]
+            crs = data.get('crs') if isinstance(data, dict) else None
+            if crs:
+                name = crs.get('properties', {}).get('name', '')
+                if name and rasterio.crs.CRS.from_user_input(name) != rasterio.crs.CRS.from_epsg(4326):
+                    raise ValueError('GeoJSON source must be WGS84 (EPSG:4326)')
+            for feature in features:
+                geometry = feature.get('geometry') if feature.get('type') == 'Feature' else feature
+                if geometry:
+                    geometries.extend(_line_parts(shape(geometry)))
+    elif suffix == '.kml':
+        import xml.etree.ElementTree as ET
+        root = ET.parse(path).getroot()
+        for element in root.iter():
+            if element.tag.rsplit('}', 1)[-1] != 'LineString':
+                continue
+            coord_el = next((child for child in element if child.tag.rsplit('}', 1)[-1] == 'coordinates'), None)
+            if coord_el is None or not coord_el.text:
+                continue
+            coords = []
+            for token in coord_el.text.split():
+                values = token.split(',')
+                if len(values) >= 2:
+                    coords.append(tuple(float(v) for v in values[:3]))
+            if len(coords) >= 2:
+                geometries.append(LineString(coords))
+    else:
+        raise ValueError('Vector input must be .gpkg, .json (Overpass), .geojson, or .kml')
+    if not geometries:
+        raise ValueError(f'No railway/roadway polylines found in {path}')
+    # Source coordinates are WGS84; DEM coordinates are projected meters.
+    # Transform without densification, retaining original vertex order and Z.
+    transformed = []
+    for geom in tqdm(geometries, desc='Projecting network lines', unit='line'):
+        projected = shape(transform_geom('EPSG:4326', target_crs, geom.__geo_interface__))
+        transformed.extend(_line_parts(projected))
+    print(f'Loaded {len(transformed):,} polylines from {path.name}', flush=True)
+    return transformed, [path.name]
+
+
+def _line_parts(geom):
+    if geom.is_empty:
+        return []
+    if geom.geom_type == 'LineString':
+        return [geom]
+    if geom.geom_type in ('MultiLineString', 'GeometryCollection'):
+        return [line for part in geom.geoms for line in _line_parts(part)]
+    return []
+
 def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offset, preserve_z, exact_vertices=False):
     path = out / 'network_lines.obj'
     idx = 1
@@ -170,8 +258,7 @@ def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offs
             if len(raw) < 2:
                 continue
             if exact_vertices:
-                if not geom.has_z:
-                    raise ValueError("Exact-vertex network export requires 3D GPKG polylines")
+                # 2D OSM lines keep their original vertex count; Z is sampled from DEM.
                 pts = raw
             else:
                 pts = [raw[0]]
@@ -200,7 +287,7 @@ def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offs
 
 def read_corridors(path, layers, target_crs):
     from shapely.strtree import STRtree
-    geometries, selected = load_lines(path, layers, target_crs)
+    geometries, selected = load_vector_lines(path, layers, target_crs)
     return STRtree(geometries), selected, geometries
 
 
@@ -427,8 +514,9 @@ def main():
     p.add_argument('--dem', required=True, help='DEM GeoTIFF or folder of DEM TIFFs')
     p.add_argument('--imagery', help='Imagery GeoTIFF or folder of imagery TIFFs (not required with --network-only)')
     p.add_argument('--rebuild-mosaics', action='store_true', help='Force recreation of cached folder mosaics')
-    p.add_argument('--gpkg', required=True)
-    p.add_argument('--network-only', action='store_true', help='Export only network_lines.obj from GPKG; skip terrain and imagery')
+    p.add_argument('--gpkg', help='GPKG, raw Overpass OSM JSON, GeoJSON, or KML input (legacy flag)')
+    p.add_argument('--network', help='Network vector file: .gpkg, .json, .geojson, or .kml')
+    p.add_argument('--network-only', action='store_true', help='Export only network_lines.obj from vector source; skip terrain and imagery')
     p.add_argument('--layer', action='append', help='Repeat for multiple layers; default all')
     p.add_argument('--output', default='terrain_output')
     p.add_argument('--near-spacing', type=float, default=3)
@@ -449,6 +537,9 @@ def main():
     p.add_argument('--texture-tile-size', type=int, default=2048, help='Maximum texture tile dimension in pixels')
     p.add_argument('--use-dem-line-z', action='store_true', help='Override any existing 3D GPKG Z values with DEM samples')
     args = p.parse_args()
+    vector_path = args.network or args.gpkg
+    if not vector_path:
+        p.error('Provide --network or --gpkg')
     if not args.network_only and not args.imagery:
         p.error('--imagery is required unless --network-only is specified')
     if not (0 < args.near_spacing <= args.transition_spacing <= args.background_spacing):
@@ -472,7 +563,7 @@ def main():
             raise ValueError('DEM must use a projected CRS in meters')
         b = dem.bounds
         if args.network_only:
-            lines, layers = load_lines(args.gpkg, args.layer, dem.crs, preserve_original_crs=True)
+            lines, layers = load_vector_lines(vector_path, args.layer, dem.crs, preserve_original_crs=True)
             # Match the normal terrain export origin and baseline without generating a mesh.
             # Rasterio's masked minimum excludes NoData pixels.
             if args.base_elevation is not None:
@@ -495,12 +586,14 @@ def main():
                 'crs': str(dem.crs), 'origin_x': b.left, 'origin_y': b.bottom,
                 'base_elevation': base, 'layers': layers,
                 'existing_line_z_preserved': not args.use_dem_line_z,
-                'network_only': True, 'exact_gpkg_vertices': True,
-                'vertex_count_modified': False, 'line_z_offset': 0.0
+                'network_only': True, 'original_network_vertices': True,
+                'vertex_count_modified': False, 'line_z_offset': 0.0,
+                'source_network': str(vector_path),
+                'xy_reprojected_to_dem_crs': Path(vector_path).suffix.lower() != '.gpkg'
             }, indent=2), encoding='utf-8')
             print(f'Done: network-only export at {out.resolve()}', flush=True)
             return
-        tree,layers,lines = read_corridors(args.gpkg,args.layer,dem.crs)
+        tree,layers,lines = read_corridors(vector_path,args.layer,dem.crs)
         corridor = None
         if args.corridor_only:
             print('Building corridor polygon...', flush=True)
@@ -584,6 +677,7 @@ def main():
             'vertices':len(vertices),'triangles':len(faces),
             'note':'Requested spacing is a maximum target; quadtree levels are powers of two.',
             'existing_line_z_preserved':not args.use_dem_line_z,
+            'source_network': str(vector_path),
             'corridor_only':args.corridor_only, 'corridor_width_m':args.corridor_width,
             'texture_resolution_m_per_pixel':args.texture_resolution,
             'texture_tile_max_pixels':args.texture_tile_size,
