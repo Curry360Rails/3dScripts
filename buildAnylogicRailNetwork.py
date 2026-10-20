@@ -85,6 +85,8 @@ def main():
     ap.add_argument('--switches', default=str(HERE / 'victorvilleRailDataSwitches.geojson'))
     ap.add_argument('--output', default=str(HERE / 'rail_3d_output'))
     ap.add_argument('--spacing', type=float, default=1.0)
+    ap.add_argument('--no-densify', action='store_true',
+                    help='Preserve cropped vertices and matched OSM nodes without adding interpolated XY points')
     ap.add_argument('--node-tolerance', type=float, default=0.30, help='OSM node to cropped geometry match in meters')
     ap.add_argument('--sample', choices=['nearest','bilinear'], default='bilinear')
     args = ap.parse_args()
@@ -143,7 +145,7 @@ def main():
             for j,(distance,nid,xy) in enumerate(anchors):
                 if j:
                     a=anchors[j-1][2]; b=xy
-                    n=max(1,math.ceil(math.dist(a,b)/args.spacing))
+                    n=1 if args.no_densify else max(1,math.ceil(math.dist(a,b)/args.spacing))
                     for step in range(1,n):
                         t=step/n
                         coords.append([a[0]+t*(b[0]-a[0]),a[1]+t*(b[1]-a[1])]);vertex_ids.append(None)
@@ -183,7 +185,9 @@ def main():
         origin={'crs':CRS,'origin_x':dem.bounds.left,'origin_y':dem.bounds.bottom,
                 'base_elevation':float(min(zs)),'dem':str(Path(args.dem).resolve()),
                 'vertical_units':'DEM native units (verify meters and vertical datum)',
-                'sample_method':args.sample,'spacing_m':args.spacing}
+                'sample_method':args.sample,
+                'densified':not args.no_densify,
+                'spacing_m':None if args.no_densify else args.spacing}
     out=Path(args.output);out.mkdir(parents=True,exist_ok=True)
     for name,features in [('rail_lines_3d.geojson',line_features),('rail_switches_3d.geojson',switch_features)]:
         (out/name).write_text(json.dumps({'type':'FeatureCollection','name':name,'crs':{'type':'name','properties':{'name':CRS}},'features':features}),encoding='utf-8')
@@ -192,6 +196,7 @@ def main():
     print(f'Wrote {len(line_features)} cropped line parts and {len(switch_features)} tagged switch points to {out}')
     print(f'Matched {len(matched_nodes)} original OSM node IDs; {sum(v>1 for v in counts.values())} occur on multiple retained lines.')
     print(f'Switches on retained lines: {sum(f["properties"]["in_retained_lines"] for f in switch_features)}')
+    print(f'Densification: {"disabled" if args.no_densify else f"enabled (max {args.spacing} m)"}')
     print('DEM elevations are terrain samples, not surveyed rail elevations.')
 
 if __name__=='__main__': main()
