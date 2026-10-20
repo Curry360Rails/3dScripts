@@ -90,49 +90,6 @@ def enumerate_tracks(level):
                     tracks.append(element)
 
     return tracks, "level / Railyard"
-    
-# def enumerate_tracks(level):
-#     from anylogic_design_time_api.generated import (
-#         RailTrack,
-#         RailwayNetwork
-#     )
-
-#     tracks = []
-
-#     for child in level.getChildren():
-
-#         if isinstance(child, RailTrack):
-#             tracks.append(child)
-
-#         elif isinstance(child, RailwayNetwork):
-#             for element in child.getChildren():
-#                 if isinstance(element, RailTrack):
-#                     tracks.append(element)
-
-#     return tracks, "level / railwayNetwork"
-
-# def enumerate_tracks(level):
-#     # BaseWorkspaceElement.getChildren() wraps items as generated classes.
-#     # Recursively inspect containers in case tracks live under nested elements.
-#     from anylogic_design_time_api.generated import RailTrack
-#     pending = [level]
-#     seen = set()
-#     tracks = []
-#     while pending:
-#         parent = pending.pop()
-#         for child in parent.getChildren():
-#             # Java wrapper identity may not be stable across calls; avoid
-#             # recursion loops using the underlying Java item's string ID.
-#             key = str(child.item)
-#             if key in seen:
-#                 continue
-#             seen.add(key)
-#             if isinstance(child, RailTrack):
-#                 tracks.append(child)
-#             else:
-#                 pending.append(child)
-#     return tracks, 'getChildren (recursive)'
-
 
 def classify(pts):
     if len(pts) < 2:
