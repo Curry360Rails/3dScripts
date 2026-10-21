@@ -388,41 +388,147 @@ def read_corridors(path, layers, target_crs):
     return STRtree(geometries), selected, geometries
 
 
-def build_cells(bounds, tree, near, middle, far, buffer, transition, max_cells, corridor_only=False, corridor_radius=100):
+# Top-level quadtree tiles are independent; workers share a fixed integer lattice.
+_REFINE = {}
+
+def _init_refine(lines_wkb, bounds, near, middle, far, buffer, transition,
+                 corridor_only, corridor_radius, dem_path, max_error, flat_spacing):
+    from shapely import from_wkb
+    from shapely.strtree import STRtree
+    lines = [from_wkb(w) for w in lines_wkb]
+    _REFINE.clear()
+    _REFINE.update(tree=STRtree(lines), bounds=bounds, near=near, middle=middle,
+                   far=far, buffer=buffer, transition=transition,
+                   corridor_only=corridor_only, radius=corridor_radius,
+                   dem_path=dem_path, max_error=max_error, flat_spacing=flat_spacing)
+
+
+def _refine_task(task):
     from shapely.geometry import box
-    x0, y0, x1, y1 = bounds
-    # Integer lattice permits exact shared vertices, eliminating T-junction cracks.
-    levels = max(1, math.ceil(math.log2(far / near)))
-    scale = 2 ** levels
-    step = far / scale
-    nx = math.ceil((x1-x0) / far)
-    ny = math.ceil((y1-y0) / far)
+    ix_start, ix_end, j, scale, step = task
+    w = _REFINE
+    x0,y0,x1,y1 = w['bounds']
+    tree = w['tree']
     cells = []
-    def subdivide(ix, iy, size):
-        xa, ya = x0 + ix*step, y0 + iy*step
-        xb, yb = min(x0+(ix+size)*step, x1), min(y0+(iy+size)*step, y1)
-        footprint = box(xa, ya, xb, yb)
-        if corridor_only:
-            nearby = tree.query(footprint.buffer(corridor_radius))
-            if not any(footprint.distance(tree.geometries[int(i)]) <= corridor_radius for i in nearby):
-                return
-        # Only query lines near the cell; never create a full-area high-resolution raster.
-        candidates = tree.query(footprint.buffer(transition))
-        distance = min((footprint.distance(tree.geometries[int(i)]) for i in candidates), default=float('inf'))
-        target = near if distance <= buffer else middle if distance <= transition else far
-        if max(xb-xa, yb-ya) > target and size > 1:
-            half = size//2
-            for dy in (0, half):
-                for dx in (0, half):
-                    subdivide(ix+dx, iy+dy, half)
-        else:
-            cells.append((ix, iy, size))
-            if len(cells) > max_cells:
-                raise ValueError(f'Exceeded --max-cells={max_cells:,}; increase spacing or reduce buffers')
-    for j in tqdm(range(ny), desc="Refining terrain cells", unit="row"):
-        for i in range(nx):
-            subdivide(i*scale, j*scale, scale)
-    return cells, step
+    dem = rasterio.open(w['dem_path']) if w['max_error'] is not None else None
+    elevation_cache = {}
+
+    def elevation(x,y):
+        key=(round(x,5),round(y,5))
+        if key not in elevation_cache:
+            val = next(dem.sample([(min(x,dem.bounds.right-1e-7),
+                                    min(y,dem.bounds.top-1e-7))], indexes=1, masked=True))[0]
+            elevation_cache[key] = None if np.ma.is_masked(val) or not np.isfinite(val) or (dem.nodata is not None and val==dem.nodata) else float(val)
+        return elevation_cache[key]
+
+    def flat_enough(xa,ya,xb,yb):
+        # Test five samples against the bilinear surface through the corners.
+        # This is a sampled tolerance, NOT a rigorous bound on the entire DEM.
+        z=[elevation(xa,ya), elevation(xb,ya), elevation(xa,yb), elevation(xb,yb)]
+        if any(v is None for v in z): return False
+        tests=[((xa+xb)/2,(ya+yb)/2,sum(z)/4),
+               ((xa+xb)/2,ya,(z[0]+z[1])/2),
+               ((xa+xb)/2,yb,(z[2]+z[3])/2),
+               (xa,(ya+yb)/2,(z[0]+z[2])/2),
+               (xb,(ya+yb)/2,(z[1]+z[3])/2)]
+        return all((v:=elevation(x,y)) is not None and abs(v-est)<=w['max_error']
+                   for x,y,est in tests)
+
+    def subdivide(ix,iy,size):
+        xa,ya=x0+ix*step,y0+iy*step
+        xb,yb=min(x0+(ix+size)*step,x1),min(y0+(iy+size)*step,y1)
+        if xa>=xb or ya>=yb:return
+        footprint=box(xa,ya,xb,yb)
+        if w['corridor_only']:
+            nearby=tree.query(footprint.buffer(w['radius']))
+            if not any(footprint.distance(tree.geometries[int(k)])<=w['radius'] for k in nearby):return
+        candidates=tree.query(footprint.buffer(w['transition']))
+        distance=min((footprint.distance(tree.geometries[int(k)]) for k in candidates),default=float('inf'))
+        target=w['near'] if distance<=w['buffer'] else w['middle'] if distance<=w['transition'] else w['far']
+        width=max(xb-xa,yb-ya)
+        should_split=width>target and size>1
+        if should_split and dem is not None and width<=w['flat_spacing'] and flat_enough(xa,ya,xb,yb):
+            should_split=False
+        if should_split:
+            half=size//2
+            for dy in (0,half):
+                for dx in (0,half):subdivide(ix+dx,iy+dy,half)
+        else:cells.append((ix,iy,size))
+    try:
+        for i in range(ix_start,ix_end):subdivide(i*scale,j*scale,scale)
+    finally:
+        if dem is not None:dem.close()
+    return cells
+
+
+def build_cells(bounds, tree, near, middle, far, buffer, transition, max_cells,
+                corridor_only=False, corridor_radius=100, workers=1,
+                dem_path=None, max_error=None, flat_spacing=20,
+                corridor_bounds=None, task_columns=16):
+    from shapely import to_wkb
+    x0,y0,x1,y1=bounds
+    levels=max(1,math.ceil(math.log2(far/near)))
+    scale=2**levels
+    step=far/scale
+    nx=math.ceil((x1-x0)/far)
+    ny=math.ceil((y1-y0)/far)
+    if corridor_only and corridor_bounds is not None:
+        cx0,cy0,cx1,cy1=corridor_bounds
+        # Restrict top-level work to the corridor, keeping DEM origin unchanged.
+        i0=max(0,math.floor((cx0-x0)/far)-1)
+        i1=min(nx,math.ceil((cx1-x0)/far)+1)
+        j0=max(0,math.floor((cy0-y0)/far)-1)
+        j1=min(ny,math.ceil((cy1-y0)/far)+1)
+    else:i0,i1,j0,j1=0,nx,0,ny
+    tasks=[(i,min(i+task_columns,i1),j,scale,step)
+           for j in range(j0,j1) for i in range(i0,i1,task_columns)]
+    print(f'Refinement: {len(tasks):,} blocks, {workers} workers, lattice step {step:.4f} m',flush=True)
+    init=([to_wkb(g) for g in tree.geometries],bounds,near,middle,far,
+          buffer,transition,corridor_only,corridor_radius,dem_path,max_error,flat_spacing)
+    cells=[]
+    if workers==1:
+        _init_refine(*init)
+        iterator=map(_refine_task,tasks)
+        for part in tqdm(iterator,total=len(tasks),desc='Refining terrain blocks',unit='block'):
+            cells.extend(part)
+            if len(cells)>max_cells:raise ValueError(f'Exceeded --max-cells={max_cells:,}')
+    else:
+        with ProcessPoolExecutor(max_workers=workers,initializer=_init_refine,initargs=init) as pool:
+            for part in tqdm(pool.map(_refine_task,tasks,chunksize=1),total=len(tasks),desc='Refining terrain blocks',unit='block'):
+                cells.extend(part)
+                if len(cells)>max_cells:raise ValueError(f'Exceeded --max-cells={max_cells:,}')
+    return cells,step
+
+
+def sample_dem_blockwise(dem, keys, bounds, step, batch_size=250000):
+    # Read each raster block once per batch rather than call dem.sample millions of times.
+    from rasterio.windows import Window
+    elevations=np.full(len(keys),np.nan,dtype=np.float32)
+    block_h,block_w=dem.block_shapes[0]
+    transform=dem.transform
+    if not transform.is_rectilinear:
+        raise ValueError('Vectorized DEM sampling requires a north-up raster')
+    for start in tqdm(range(0,len(keys),batch_size),desc='Sampling DEM blocks',unit='batch'):
+        end=min(start+batch_size,len(keys))
+        part=keys[start:end]
+        xs=np.array([min(bounds.right-1e-7,bounds.left+k[0]*step) for k in part])
+        ys=np.array([min(bounds.top-1e-7,bounds.bottom+k[1]*step) for k in part])
+        cols=np.floor((xs-transform.c)/transform.a).astype(np.int64)
+        rows=np.floor((ys-transform.f)/transform.e).astype(np.int64)
+        good=(rows>=0)&(rows<dem.height)&(cols>=0)&(cols<dem.width)
+        block_ids=(rows//block_h)*((dem.width+block_w-1)//block_w)+(cols//block_w)
+        for bid in np.unique(block_ids[good]):
+            indices=np.flatnonzero(good & (block_ids==bid))
+            r0=int(rows[indices[0]]//block_h*block_h)
+            c0=int(cols[indices[0]]//block_w*block_w)
+            window=Window(c0,r0,min(block_w,dem.width-c0),min(block_h,dem.height-r0))
+            arr=dem.read(1,window=window,masked=True)
+            values=np.ma.asarray(arr[rows[indices]-r0,cols[indices]-c0])
+            data=np.asarray(values.astype(np.float32).filled(np.nan),dtype=np.float32)
+            if dem.nodata is not None:data[data==dem.nodata]=np.nan
+            data[~np.isfinite(data)]=np.nan
+            elevations[start+indices]=data
+    return elevations
 
 
 def mesh_topology(cells):
@@ -526,7 +632,7 @@ def _clip_batch(batch):
 
 def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, valid,
                           faces, step, base, corridor, resolution, tile_pixels,
-                          workers=1, clip_batch_size=4000):
+                          workers=1, clip_batch_size=4000, texture_scale=1.0):
     """Clip faces in batches; avoid intersections for interior faces; parallel on request."""
     from shapely import to_wkb
     b=bounds
@@ -561,8 +667,8 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
             for (ix,iy),pieces in tqdm(sorted(tile_polygons.items()),desc='Exporting texture tiles',unit='tile'):
                 tx0,ty0=x0+ix*tile_m,y0+iy*tile_m
                 tx1,ty1=min(tx0+tile_m,b.right),min(ty0+tile_m,b.top)
-                w=max(2,math.ceil((tx1-tx0)/resolution))
-                h=max(2,math.ceil((ty1-ty0)/resolution))
+                w=max(2,math.ceil((tx1-tx0)/resolution*texture_scale))
+                h=max(2,math.ceil((ty1-ty0)/resolution*texture_scale))
                 rgb=imagery.render((tx0,ty0,tx1,ty1),w,h)
                 texname=f'corridor_{ix}_{iy}.png'
                 Image.fromarray(rgb).save(textures/texname)
@@ -615,11 +721,15 @@ def main():
     p.add_argument('--transition-buffer', type=float, default=200)
     p.add_argument('--line-spacing', type=float, default=3)
     p.add_argument('--line-z-offset', type=float, default=0.5)
-    p.add_argument('--max-cells', type=int, default=5_000_000)
+    p.add_argument('--max-cells', type=int, default=2_000_000)
     p.add_argument('--max-texture', type=int, default=8192)
     p.add_argument('--base-elevation', type=float)
     p.add_argument('--workers', type=int, default=8, help='Clipping worker processes (1 disables multiprocessing)')
     p.add_argument('--clip-batch-size', type=int, default=4000)
+    p.add_argument('--refine-workers', type=int, default=12, help='CPU processes for quadtree refinement')
+    p.add_argument('--max-elevation-error', type=float, default=None, help='Optional sampled vertical error tolerance in meters; experimental')
+    p.add_argument('--flat-spacing', type=float, default=20, help='Maximum cell width eligible for error-based early stop (m)')
+    p.add_argument('--texture-scale', type=float, default=1.0, help='Texture linear resolution multiplier (0,1]')
     p.add_argument('--corridor-only', action='store_true', help='Export only terrain inside the rail corridor buffer')
     p.add_argument('--corridor-width', type=float, default=400, help='Total corridor width in meters')
     p.add_argument('--texture-resolution', type=float, default=0.5, help='Texture meters per pixel in corridor mode')
@@ -637,8 +747,10 @@ def main():
         p.error('Require 0 <= fine-buffer < transition-buffer')
     if args.max_texture < 2 or args.line_spacing <= 0 or args.max_cells <= 0:
         p.error('Invalid max-texture, line-spacing or max-cells')
-    if args.workers < 1 or args.clip_batch_size < 1:
+    if args.workers < 1 or args.refine_workers < 1 or args.clip_batch_size < 1:
         p.error('workers and clip-batch-size must be positive')
+    if not (0 < args.texture_scale <= 1) or args.flat_spacing <= 0 or (args.max_elevation_error is not None and args.max_elevation_error < 0):
+        p.error('Invalid texture-scale, flat-spacing or max-elevation-error')
     if args.corridor_width <= 0 or args.texture_resolution <= 0 or args.texture_tile_size < 2:
         p.error('Corridor width, texture resolution and texture tile size must be positive')
     out = Path(args.output); out.mkdir(parents=True,exist_ok=True)
@@ -702,22 +814,16 @@ def main():
         cells,step = build_cells((b.left,b.bottom,b.right,b.top),tree,args.near_spacing,
                                  args.transition_spacing,args.background_spacing,
                                  args.fine_buffer,args.transition_buffer,args.max_cells,
-                                 args.corridor_only,args.corridor_width/2)
+                                 args.corridor_only,args.corridor_width/2,
+                                 workers=args.refine_workers,dem_path=dem_path,
+                                 max_error=args.max_elevation_error,flat_spacing=args.flat_spacing,
+                                 corridor_bounds=corridor.bounds if corridor is not None else None)
         print(f'Adaptive cells: {len(cells):,}; building stitched topology...',flush=True)
         vertices,faces = mesh_topology(cells)
         print(f'Vertices: {len(vertices):,}; faces: {len(faces):,}; sampling DEM...',flush=True)
         keys = list(vertices)
         # DEM sampling in bounded batches; sample at actual vertex locations.
-        elevations = np.full(len(keys),np.nan,dtype=np.float32)
-        for start in tqdm(range(0,len(keys),25000), desc="Sampling DEM", unit="batch"):
-            chunk = keys[start:start+25000]
-            coords = [(min(b.right-1e-7,b.left+k[0]*step),
-                       min(b.top-1e-7,b.bottom+k[1]*step)) for k in chunk]
-            samples = dem.sample(coords,indexes=1,masked=True)
-            for j,sample in enumerate(samples):
-                z = sample[0]
-                if not np.ma.is_masked(z) and np.isfinite(z) and (dem.nodata is None or z != dem.nodata):
-                    elevations[start+j] = z
+        elevations = sample_dem_blockwise(dem, keys, b, step)
         valid = np.isfinite(elevations)
         if not valid.any():
             raise ValueError('No valid DEM elevations at mesh vertices')
@@ -725,7 +831,7 @@ def main():
         if args.corridor_only:
             stats = export_corridor_tiled(out, dem, imagery_sources, b, keys, elevations, valid, faces,
                                           step, base, corridor, args.texture_resolution,
-                                          args.texture_tile_size, args.workers, args.clip_batch_size)
+                                          args.texture_tile_size, args.workers, args.clip_batch_size, args.texture_scale)
             tw = th = 0
         else:
             with VirtualImagery(imagery_sources, dem.crs) as imagery:
@@ -762,7 +868,9 @@ def main():
             'corridor_only':args.corridor_only, 'corridor_width_m':args.corridor_width,
             'texture_resolution_m_per_pixel':args.texture_resolution,
             'texture_tile_max_pixels':args.texture_tile_size,
-            'clip_workers':args.workers,
+            'clip_workers':args.workers, 'refine_workers':args.refine_workers,
+            'max_elevation_error':args.max_elevation_error, 'flat_spacing':args.flat_spacing,
+            'texture_scale':args.texture_scale,
             'dem_sources':dem_sources, 'imagery_sources':imagery_sources,
             'imagery_mode':'on_demand_warped_vrt'
         },indent=2))
