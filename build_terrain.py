@@ -1,5 +1,10 @@
 """Adaptive, crack-free terrain mesh from a DEM and GeoPackage corridor lines."""
 import argparse
+import csv
+import struct
+import shutil
+import tempfile
+import io
 import bisect
 import json
 import math
@@ -630,9 +635,233 @@ def _clip_batch(batch):
     return results
 
 
+
+# Bridge geometry is derived from OSM ways and DEM approach elevations. This
+# intentionally does NOT edit the bare-earth DEM or infer a clearance from layer tags.
+def bridge_profiles(infrastructure_path, dem, corridor, approach_m=12.0,
+                    min_clearance_m=0.0):
+    """Return profiles for OSM-tagged bridge ways, retaining OSM node identities."""
+    data = json.loads(Path(infrastructure_path).read_text(encoding='utf-8-sig'))
+    if not isinstance(data, dict) or not isinstance(data.get('elements'), list):
+        raise ValueError('Bridge input must be raw Overpass JSON with elements')
+    elements = data['elements']
+    nodes = {e['id']: (e['lon'], e['lat']) for e in elements
+             if e.get('type') == 'node' and 'lon' in e and 'lat' in e}
+    records = []
+    for way in elements:
+        if way.get('type') != 'way':
+            continue
+        tags = way.get('tags') or {}
+        if str(tags.get('bridge', '')).lower() in ('', 'no', 'false', '0'):
+            continue
+        kind = 'railway' if tags.get('railway') == 'rail' else 'road' if tags.get('highway') else None
+        if kind is None:
+            continue
+        ids = way.get('nodes') or []
+        if len(ids) < 2 or any(n not in nodes for n in ids):
+            continue
+        xy = [nodes[n] for n in ids]
+        projected = shape(transform_geom('EPSG:4326', dem.crs, {'type':'LineString','coordinates':xy}))
+        coords = [(float(x), float(y)) for x,y,*_ in projected.coords]
+        line = LineString(coords)
+        if line.length < 0.1 or not line.intersects(corridor):
+            continue
+        # Sample just beyond the bridge endpoints, where the ground is more
+        # likely to represent the approaches, not the void beneath the span.
+        d = min(approach_m, max(1.0, line.length * 0.25))
+        def approach(first):
+            a,b = (coords[0],coords[1]) if first else (coords[-1],coords[-2])
+            dx,dy = a[0]-b[0],a[1]-b[1]
+            length = math.hypot(dx,dy)
+            if length < 1e-9: return a
+            return (a[0]+dx/length*d,a[1]+dy/length*d)
+        sample_points = [approach(True),approach(False)]
+        # At DEM edges, fall back to the bridge endpoint rather than discarding
+        # an otherwise valid bridge. This is a lower-confidence estimate.
+        used_endpoint_fallback = False
+        for k, point in enumerate(sample_points):
+            if not (dem.bounds.left <= point[0] < dem.bounds.right and
+                    dem.bounds.bottom < point[1] <= dem.bounds.top):
+                sample_points[k] = coords[0] if k == 0 else coords[-1]
+                used_endpoint_fallback = True
+        zvals=[]
+        for value in dem.sample(sample_points, indexes=1, masked=True):
+            z = value[0]
+            zvals.append(None if np.ma.is_masked(z) or not np.isfinite(z) or
+                         (dem.nodata is not None and z == dem.nodata) else float(z))
+        if any(z is None for z in zvals):
+            status = 'unresolved_missing_dem_approach'
+            profile = []
+        else:
+            # Interpolate by cumulative arc length, not vertex index.
+            lengths=[0.0]
+            for a,b in zip(coords,coords[1:]):
+                lengths.append(lengths[-1]+math.dist(a,b))
+            profile = [[x,y,zvals[0]+(zvals[1]-zvals[0])*t/lengths[-1]]
+                       for (x,y),t in zip(coords,lengths)]
+            ground=[]
+            for value in dem.sample(coords, indexes=1, masked=True):
+                z=value[0]
+                ground.append(None if np.ma.is_masked(z) or not np.isfinite(z) else float(z))
+            clearance = [p[2]-g for p,g in zip(profile,ground) if g is not None]
+            status = ('review_low_clearance' if clearance and min(clearance)<min_clearance_m
+                      else 'review_endpoint_fallback' if used_endpoint_fallback
+                      else 'estimated_from_approaches')
+        records.append({'osm_way_id':way['id'], 'type':kind,
+                        'osm_node_ids':ids, 'tags':tags,
+                        'approach_z_m':zvals, 'profile_xyz':profile,
+                        'length_m':line.length, 'status':status})
+    return records
+
+
+def save_bridge_profiles(out, records, dem_crs):
+    (out/'bridge_profiles.json').write_text(json.dumps({
+        'crs':str(dem_crs), 'method':'linear interpolation between DEM approach samples',
+        'note':'Estimated geometry; not surveyed bridge-deck elevations.',
+        'bridges':records}, indent=2),encoding='utf-8')
+    with (out/'bridge_review.csv').open('w',newline='',encoding='utf-8') as f:
+        writer=csv.writer(f)
+        writer.writerow(['osm_way_id','type','length_m','start_approach_z_m',
+                         'end_approach_z_m','status','bridge_tag','layer'])
+        for r in records:
+            z=r['approach_z_m']
+            writer.writerow([r['osm_way_id'],r['type'],round(r['length_m'],2),
+                             z[0],z[1],r['status'],r['tags'].get('bridge',''),r['tags'].get('layer','')])
+
+
+def bridge_deck_mesh(record, width_m, origin_x, origin_y, base):
+    """Generate a top-only strip; deck thickness and support piers are not inferred."""
+    points=record['profile_xyz']
+    if len(points)<2: return [],[],None
+    # Build a normal at each centerline vertex using adjacent tangents.
+    normals=[]
+    for i,p in enumerate(points):
+        before=points[max(0,i-1)];after=points[min(len(points)-1,i+1)]
+        dx=after[0]-before[0];dy=after[1]-before[1]
+        mag=math.hypot(dx,dy)
+        if mag<1e-9:return [],[],None
+        normals.append((-dy/mag,dx/mag))
+    left=[];right=[]
+    for p,n in zip(points,normals):
+        left.append((p[0]+n[0]*width_m/2,p[1]+n[1]*width_m/2,p[2]))
+        right.append((p[0]-n[0]*width_m/2,p[1]-n[1]*width_m/2,p[2]))
+    vertices=[];uv=[]
+    for i in range(len(points)-1):
+        for q in (left[i],right[i],right[i+1],left[i],right[i+1],left[i+1]):
+            vertices.append((q[0]-origin_x,q[1]-origin_y,q[2]-base))
+    xs=[q[0] for q in left+right];ys=[q[1] for q in left+right]
+    bounds=(min(xs),min(ys),max(xs),max(ys))
+    if bounds[2]-bounds[0]<1e-6 or bounds[3]-bounds[1]<1e-6:return [],[],None
+    for x,y,z in vertices:
+        # glTF UV uses flipped V relative to OBJ's original geographic UV.
+        uv.append(((x+origin_x-bounds[0])/(bounds[2]-bounds[0]),
+                   1-(y+origin_y-bounds[1])/(bounds[3]-bounds[1])))
+    return vertices,uv,bounds
+
+
+def append_bridge_decks(glb, records, imagery, bounds, base, resolution,
+                        rail_width, road_width, max_texture_px=2048):
+    added=0
+    for r in tqdm(records,desc='Exporting bridge decks',unit='bridge'):
+        if not r['profile_xyz']:continue
+        width=rail_width if r['type']=='railway' else road_width
+        verts,uv,extent=bridge_deck_mesh(r,width,bounds.left,bounds.bottom,base)
+        if not verts:continue
+        xmin,ymin,xmax,ymax=extent
+        w=min(max_texture_px,max(2,math.ceil((xmax-xmin)/resolution)))
+        h=min(max_texture_px,max(2,math.ceil((ymax-ymin)/resolution)))
+        rgb=imagery.render(extent,w,h)
+        glb.add_tile(f"Bridge_{r['type']}_{r['osm_way_id']}",verts,uv,Image.fromarray(rgb))
+        added+=1
+    return added
+
+
+class StreamingGLB:
+    """Write embedded textured glTF 2.0 directly, without OBJ or Blender."""
+    def __init__(self, path):
+        self.path = Path(path)
+        self.tmp = tempfile.TemporaryFile(mode='w+b')
+        self.doc = {'asset': {'version': '2.0', 'generator': 'Adaptive Terrain Direct GLB'},
+                    'scene': 0, 'scenes': [{'nodes': []}], 'nodes': [],
+                    'meshes': [], 'materials': [], 'textures': [], 'images': [],
+                    'samplers': [{'magFilter': 9729, 'minFilter': 9987, 'wrapS': 33071, 'wrapT': 33071}],
+                    'bufferViews': [], 'accessors': []}
+        self.count = 0
+
+    def add_buffer(self, data, target=None):
+        offset = self.tmp.tell()
+        self.tmp.write(data)
+        self.tmp.write(b'\x00' * ((-len(data)) % 4))
+        view = {'buffer': 0, 'byteOffset': offset, 'byteLength': len(data)}
+        if target is not None:
+            view['target'] = target
+        index = len(self.doc['bufferViews'])
+        self.doc['bufferViews'].append(view)
+        return index
+
+    def add_tile(self, name, vertices, uv, image):
+        if not vertices:
+            return
+        positions = np.asarray(vertices, dtype='<f4').reshape((-1, 3))
+        texcoords = np.asarray(uv, dtype='<f4').reshape((-1, 2))
+        if len(positions) != len(texcoords) or len(positions) % 3:
+            raise ValueError('GLB tile must contain triangle vertices and matching UVs')
+        # Blender OBJ -> GLB convention: Z-up source becomes glTF Y-up.
+        positions = positions[:, [0, 2, 1]].copy()
+        positions[:, 2] *= -1
+        pview = self.add_buffer(positions.tobytes(), 34962)
+        tview = self.add_buffer(texcoords.tobytes(), 34962)
+        image_buffer = io.BytesIO()
+        image.save(image_buffer, format='PNG')
+        iview = self.add_buffer(image_buffer.getvalue())
+        image_id = len(self.doc['images'])
+        self.doc['images'].append({'bufferView': iview, 'mimeType': 'image/png', 'name': name})
+        texture_id = len(self.doc['textures'])
+        self.doc['textures'].append({'sampler': 0, 'source': image_id})
+        material_id = len(self.doc['materials'])
+        self.doc['materials'].append({'name': name, 'doubleSided': True,
+            'pbrMetallicRoughness': {'baseColorTexture': {'index': texture_id},
+                                     'baseColorFactor': [1,1,1,1],
+                                     'metallicFactor': 0, 'roughnessFactor': 1}})
+        pa = len(self.doc['accessors'])
+        self.doc['accessors'].append({'bufferView': pview, 'componentType': 5126,
+            'count': len(positions), 'type': 'VEC3',
+            'min': positions.min(axis=0).tolist(), 'max': positions.max(axis=0).tolist()})
+        ta = len(self.doc['accessors'])
+        self.doc['accessors'].append({'bufferView': tview, 'componentType': 5126,
+            'count': len(texcoords), 'type': 'VEC2'})
+        mesh_id = len(self.doc['meshes'])
+        self.doc['meshes'].append({'name': name, 'primitives': [{
+            'attributes': {'POSITION': pa, 'TEXCOORD_0': ta},
+            'material': material_id, 'mode': 4}]})
+        node_id = len(self.doc['nodes'])
+        self.doc['nodes'].append({'name': name, 'mesh': mesh_id})
+        self.doc['scenes'][0]['nodes'].append(node_id)
+        self.count += len(positions)
+
+    def finish(self):
+        size = self.tmp.tell()
+        self.doc['buffers'] = [{'byteLength': size}]
+        js = json.dumps(self.doc, separators=(',', ':')).encode('utf-8')
+        js += b' ' * ((-len(js)) % 4)
+        total = 12 + 8 + len(js) + 8 + size
+        if total >= 2**32:
+            raise ValueError('GLB exceeds the 4 GiB format limit; reduce geometry or texture scale')
+        self.tmp.seek(0)
+        with self.path.open('wb') as output:
+            output.write(struct.pack('<4sII', b'glTF', 2, total))
+            output.write(struct.pack('<I4s', len(js), b'JSON'))
+            output.write(js)
+            output.write(struct.pack('<I4s', size, b'BIN\x00'))
+            shutil.copyfileobj(self.tmp, output, length=8*1024*1024)
+        self.tmp.close()
+        print(f'GLB exported: {self.path} ({total/1024**2:.1f} MiB, {self.count:,} vertices)', flush=True)
+
+
 def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, valid,
                           faces, step, base, corridor, resolution, tile_pixels,
-                          workers=1, clip_batch_size=4000, texture_scale=1.0):
+                          workers=1, clip_batch_size=4000, texture_scale=1.0, output_format="obj",
+                          bridges=None, rail_bridge_width=6.0, road_bridge_width=12.0):
     """Clip faces in batches; avoid intersections for interior faces; parallel on request."""
     from shapely import to_wkb
     b=bounds
@@ -658,12 +887,18 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
     print(f'Clipping completed in {time.perf_counter()-start:.1f}s using {workers} worker(s)',flush=True)
     if not tile_polygons:
         raise ValueError('No valid corridor terrain faces. Check DEM coverage and corridor location.')
-    textures=out/'textures'; textures.mkdir(exist_ok=True)
+    is_glb = output_format == 'glb'
+    if not is_glb:
+        textures=out/'textures'; textures.mkdir(exist_ok=True)
     material_lines=[]
     vertex_index=0
-    with VirtualImagery(imagery_sources, dem.crs) as imagery:
-        with (out/'terrain.obj').open('w',encoding='utf8',buffering=1024*1024) as obj:
+    glb = StreamingGLB(out/'terrain.glb') if is_glb else None
+    obj = None
+    try:
+        if not is_glb:
+            obj = (out/'terrain.obj').open('w', encoding='utf8', buffering=1024*1024)
             obj.write('mtllib terrain.mtl\n')
+        with VirtualImagery(imagery_sources, dem.crs) as imagery:
             for (ix,iy),pieces in tqdm(sorted(tile_polygons.items()),desc='Exporting texture tiles',unit='tile'):
                 tx0,ty0=x0+ix*tile_m,y0+iy*tile_m
                 tx1,ty1=min(tx0+tile_m,b.right),min(ty0+tile_m,b.top)
@@ -671,16 +906,18 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
                 h=max(2,math.ceil((ty1-ty0)/resolution*texture_scale))
                 rgb=imagery.render((tx0,ty0,tx1,ty1),w,h)
                 texname=f'corridor_{ix}_{iy}.png'
-                Image.fromarray(rgb).save(textures/texname)
                 mat=f'Corridor_{ix}_{iy}'
-                material_lines.append(f'newmtl {mat}\nKd 1 1 1\nmap_Kd textures/{texname}\n')
-                obj.write(f'o Tile_{ix}_{iy}\nusemtl {mat}\n')
+                if not is_glb:
+                    Image.fromarray(rgb).save(textures/texname)
+                    material_lines.append(f'newmtl {mat}\nKd 1 1 1\nmap_Kd textures/{texname}\n')
+                    obj.write(f'o Tile_{ix}_{iy}\nusemtl {mat}\n')
+                tile_vertices=[]
+                tile_uv=[]
                 for part,ids in pieces:
                     a,c,d=ids
                     xA,yA=xy[a-1];xB,yB=xy[c-1];xC,yC=xy[d-1]
                     denom=(yB-yC)*(xA-xC)+(xC-xB)*(yA-yC)
                     if abs(denom)<1e-12:continue
-                    # Already-triangular polygons can be exported directly.
                     if len(part.interiors)==0 and len(part.exterior.coords)==4:
                         triangles=(part,)
                     else:
@@ -688,6 +925,11 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
                     for triangle in triangles:
                         if triangle.area<1e-10:continue
                         coords=list(triangle.exterior.coords)[:3]
+                        # Preserve CCW XY winding for upward-facing terrain.
+                        cross=((coords[1][0]-coords[0][0])*(coords[2][1]-coords[0][1])
+                               -(coords[1][1]-coords[0][1])*(coords[2][0]-coords[0][0]))
+                        if cross < 0:
+                            coords[1],coords[2]=coords[2],coords[1]
                         for x,y in coords:
                             wa=((yB-yC)*(x-xC)+(xC-xB)*(y-yC))/denom
                             wb=((yC-yA)*(x-xC)+(xA-xC)*(y-yC))/denom
@@ -695,22 +937,87 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
                             z=wa*elevations[a-1]+wb*elevations[c-1]+wc*elevations[d-1]
                             u=(x-tx0)/(tx1-tx0)
                             v=(y-ty0)/(ty1-ty0)
-                            obj.write(f'v {x-x0:.5f} {y-y0:.5f} {z-base:.5f}\n')
-                            obj.write(f'vt {u:.9f} {v:.9f}\n')
-                        obj.write(f'f {vertex_index+1}/{vertex_index+1} {vertex_index+2}/{vertex_index+2} {vertex_index+3}/{vertex_index+3}\n')
+                            if is_glb:
+                                tile_vertices.append((x-x0, y-y0, z-base))
+                                tile_uv.append((u,1.0-v))
+                            else:
+                                obj.write(f'v {x-x0:.5f} {y-y0:.5f} {z-base:.5f}\n')
+                                obj.write(f'vt {u:.9f} {v:.9f}\n')
+                        if not is_glb:
+                            obj.write(f'f {vertex_index+1}/{vertex_index+1} {vertex_index+2}/{vertex_index+2} {vertex_index+3}/{vertex_index+3}\n')
                         vertex_index+=3
-    (out/'terrain.mtl').write_text('\n'.join(material_lines),encoding='utf8')
-    print(f'Corridor export: {len(tile_polygons):,} texture tiles, {vertex_index:,} OBJ vertices',flush=True)
+                if is_glb:
+                    glb.add_tile(mat, tile_vertices, tile_uv, Image.fromarray(rgb))
+            if is_glb and bridges:
+                n=append_bridge_decks(glb,bridges,imagery,b,base,
+                       resolution/texture_scale,rail_bridge_width,road_bridge_width)
+                print(f'Added {n} estimated bridge decks to GLB',flush=True)
+        if is_glb:
+            glb.finish()
+        else:
+            (out/'terrain.mtl').write_text('\n'.join(material_lines),encoding='utf8')
+    finally:
+        if obj is not None:
+            obj.close()
+        if glb is not None:
+            glb.tmp.close()
+    print(f'Corridor export: {len(tile_polygons):,} texture tiles, {vertex_index:,} vertices ({output_format})',flush=True)
     return {'tiles':len(tile_polygons),'vertices':vertex_index}
+
+
+
+def resolve_infrastructure_path(explicit_path, network_path, output_path):
+    """Find the Overpass infrastructure JSON without depending on the working directory."""
+    network = Path(network_path).expanduser().resolve()
+    output = Path(output_path).expanduser().resolve()
+    script_dir = Path(__file__).resolve().parent
+
+    if explicit_path:
+        chosen = Path(explicit_path).expanduser()
+        candidates = [chosen] if chosen.is_absolute() else [
+            Path.cwd() / chosen, script_dir / chosen, network.parent / chosen,
+        ]
+    else:
+        candidates = [
+            network.parent / 'infrastructure_raw_osm.json',
+            output.parent / 'osm_output' / 'infrastructure_raw_osm.json',
+            script_dir / 'osm_output' / 'infrastructure_raw_osm.json',
+            Path.cwd() / 'osm_output' / 'infrastructure_raw_osm.json',
+            script_dir / 'infrastructure_raw_osm.json',
+        ]
+
+    checked = []
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in checked:
+            continue
+        checked.append(candidate)
+        if candidate.is_file():
+            print(f'Using infrastructure JSON: {candidate}', flush=True)
+            return candidate
+    raise FileNotFoundError(
+        'Bridge-aware infrastructure JSON not found. Searched:\n  '
+        + '\n  '.join(map(str, checked))
+        + '\nGenerate infrastructure_raw_osm.json using the updated Overpass query, '
+        'or pass --infrastructure with its exact path.'
+    )
 
 
 def main():
     p = argparse.ArgumentParser(description='Adaptive textured terrain OBJ refined around GeoPackage roads/railways')
+    p.add_argument('--format', choices=['obj', 'glb'], default='obj', help='Terrain output format; GLB embeds textures')
     p.add_argument('--dem', required=True, help='DEM GeoTIFF or folder of DEM TIFFs')
     p.add_argument('--imagery', help='Imagery GeoTIFF or folder of imagery TIFFs (not required with --network-only)')
     p.add_argument('--rebuild-mosaics', action='store_true', help='Force recreation of cached DEM mosaic (imagery is virtual)')
     p.add_argument('--gpkg', help='GPKG, raw Overpass OSM JSON, GeoJSON, or KML input (legacy flag)')
     p.add_argument('--network', help='Network vector file: .gpkg, .json, .geojson, or .kml')
+    p.add_argument('--infrastructure', help='Raw infrastructure_raw_osm.json from bridge-aware Overpass query')
+    p.add_argument('--bridges', action='store_true', help='Estimate bridge elevations and add separate textured decks to GLB')
+    p.add_argument('--bridge-approach-m', type=float, default=12.0)
+    p.add_argument('--rail-bridge-width', type=float, default=6.0)
+    p.add_argument('--road-bridge-width', type=float, default=12.0)
+    p.add_argument('--bridge-review-clearance', type=float, default=0.0,
+                   help='Flag inferred deck elevations less than this many meters above sampled ground')
     p.add_argument('--network-only', action='store_true', help='Export only network_lines.obj from vector source; skip terrain and imagery')
     p.add_argument('--layer', action='append', help='Repeat for multiple layers; default all')
     p.add_argument('--output', default='terrain_output')
@@ -739,6 +1046,10 @@ def main():
     vector_path = args.network or args.gpkg
     if not vector_path:
         p.error('Provide --network or --gpkg')
+    if args.bridges and (not args.corridor_only or args.format != 'glb'):
+        p.error('--bridges currently requires --corridor-only --format glb')
+    if min(args.bridge_approach_m,args.rail_bridge_width,args.road_bridge_width)<=0:
+        p.error('Bridge approach distance and widths must be positive')
     if not args.network_only and not args.imagery:
         p.error('--imagery is required unless --network-only is specified')
     if not (0 < args.near_spacing <= args.transition_spacing <= args.background_spacing):
@@ -754,6 +1065,9 @@ def main():
     if args.corridor_width <= 0 or args.texture_resolution <= 0 or args.texture_tile_size < 2:
         p.error('Corridor width, texture resolution and texture tile size must be positive')
     out = Path(args.output); out.mkdir(parents=True,exist_ok=True)
+    # Resolve before expensive DEM sampling and mesh generation.
+    infrastructure = (resolve_infrastructure_path(args.infrastructure, vector_path, out)
+                      if args.bridges and not args.network_only else None)
     dem_path, dem_sources = resolve_raster_input(args.dem, 'DEM', out, refresh=args.rebuild_mosaics)
     with rasterio.open(dem_path) as dem:
         imagery_path = None
@@ -828,12 +1142,21 @@ def main():
         if not valid.any():
             raise ValueError('No valid DEM elevations at mesh vertices')
         base = float(np.min(elevations[valid])) if args.base_elevation is None else args.base_elevation
+        bridge_records=[]
+        if args.bridges:
+            bridge_records=bridge_profiles(infrastructure,dem,corridor,args.bridge_approach_m,
+                                           args.bridge_review_clearance)
+            save_bridge_profiles(out,bridge_records,dem.crs)
+            print(f'Bridge candidates: {len(bridge_records)}; review bridge_review.csv',flush=True)
         if args.corridor_only:
             stats = export_corridor_tiled(out, dem, imagery_sources, b, keys, elevations, valid, faces,
                                           step, base, corridor, args.texture_resolution,
-                                          args.texture_tile_size, args.workers, args.clip_batch_size, args.texture_scale)
+                                          args.texture_tile_size, args.workers, args.clip_batch_size, args.texture_scale, args.format,
+                                          bridge_records, args.rail_bridge_width, args.road_bridge_width)
             tw = th = 0
         else:
+            if args.format == "glb":
+                raise ValueError("Direct GLB currently requires --corridor-only")
             with VirtualImagery(imagery_sources, dem.crs) as imagery:
                 # Keep existing max-texture behavior without creating a source mosaic.
                 ratio = min(1.0, args.max_texture / max(dem.width, dem.height))
@@ -870,9 +1193,10 @@ def main():
             'texture_tile_max_pixels':args.texture_tile_size,
             'clip_workers':args.workers, 'refine_workers':args.refine_workers,
             'max_elevation_error':args.max_elevation_error, 'flat_spacing':args.flat_spacing,
-            'texture_scale':args.texture_scale,
+            'texture_scale':args.texture_scale, 'terrain_format':args.format,
             'dem_sources':dem_sources, 'imagery_sources':imagery_sources,
-            'imagery_mode':'on_demand_warped_vrt'
+            'imagery_mode':'on_demand_warped_vrt',
+            'bridge_aware':args.bridges, 'bridge_profiles':'bridge_profiles.json' if args.bridges else None
         },indent=2))
         print(f'Done: {out.resolve()} | source mesh {len(vertices):,} vertices, {len(faces):,} triangles' + (' | corridor tiles: '+str(stats['tiles']) if args.corridor_only else f' | texture {tw}x{th}'))
 
