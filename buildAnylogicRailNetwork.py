@@ -24,11 +24,11 @@ TERRAIN_GEOREFERENCE = DATA_DIR / 'georeference.json'
 # Match the Z offset used when exporting network_lines.obj (normally 0.5 m).
 RAIL_Z_OFFSET_M = 0.5
 # Credentials are read from an environment variable; never hardcode tokens.
-TOKEN = 'f9c7dad9-03c7-45f6-8d67-4793c0116773'#os.environ.get('ANYLOGIC_DESIGN_TIME_TOKEN', '')
+TOKEN = os.environ.get('ANYLOGIC_DESIGN_TIME_TOKEN', '')
 MODEL_NAME = 'test3D'
 AGENT_NAME = 'Main'
 LEVEL_INDEX = 0
-DRY_RUN = False  # Review topology before setting False.
+DRY_RUN = True  # Review topology before setting False.
 EXPECTED_NETWORKS = 4  # Warning only; no artificial connectivity.
 MODEL_UNITS_PER_METER = 0.03
 FLIP_Y = True
@@ -332,7 +332,15 @@ def main():
                 ((oy-p[1]) if FLIP_Y else (p[1]-oy))*MODEL_UNITS_PER_METER,
                 (p[2]-base)*MODEL_UNITS_PER_METER)
     ws=Workspace(TOKEN)
-    level=ws.getModel(MODEL_NAME).getAgent(AGENT_NAME).getLevels()[LEVEL_INDEX]
+    agent = ws.getModel(MODEL_NAME).getAgent(AGENT_NAME)
+    if not (math.isfinite(MODEL_UNITS_PER_METER) and MODEL_UNITS_PER_METER > 0):
+        raise ValueError('MODEL_UNITS_PER_METER must be a positive finite number')
+    # Agent.setScale expects real-world meters per presentation pixel.
+    meters_per_pixel = 1.0 / MODEL_UNITS_PER_METER
+    agent.setScale(meters_per_pixel)
+    print(f'Set {AGENT_NAME} scale: 1 meter = {MODEL_UNITS_PER_METER:g} px '
+          f'({meters_per_pixel:.6f} meters/px)', flush=True)
+    level = agent.getLevels()[LEVEL_INDEX]
     switches={}
     for n,c in switch_nodes.items():
         x,y,z=cv(c)
@@ -360,38 +368,9 @@ def main():
         rel=[v for x,y,z in pts for v in (x-x0,y-y0,z-z0)]
         # setPointList() accepts flat XYZ values and preserves relative Z.
         # createStraightPointsList() is not needed for this input.
-        
         prepared = Utils.createStraightPointsList(track, rel)
-
-
-        # Each original vertex generates three XYZ control-point entries.
-        # Restore the relative Z elevation for all three.
-        for i in range(len(pts)):
-            z = pts[i][2] - z0
-
-            for j in range(3):
-                index = (i * 3 + j) * 3 + 2
-                prepared[index] = z
-
         print(f"SETTING POINTS {track_name} ({len(pts)} vertices)", flush=True)
         track.setPointList(prepared)
-
-        rel = [v for x, y, z in pts for v in (x-x0, y-y0, z-z0)]
-
-        prepared = list(Utils.createStraightPointsList(track, rel))
-
-        expected_length = len(pts) * 9
-
-        if len(prepared) != expected_length:
-            raise ValueError(
-                f"Unexpected point-list structure: "
-                f"{len(prepared)} values; expected {expected_length}"
-            )
-
-        for i, (_, _, z) in enumerate(pts):
-            relative_z = z - z0
-
-
         print(f"POINTS SET {track_name}", flush=True)
         if PAUSE_AFTER_POINTS:
             input(f"[{track_name}] Points set. Press Enter to continue... ")
