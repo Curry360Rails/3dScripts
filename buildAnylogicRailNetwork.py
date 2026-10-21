@@ -368,7 +368,12 @@ def main():
         rel=[v for x,y,z in pts for v in (x-x0,y-y0,z-z0)]
         # setPointList() accepts flat XYZ values and preserves relative Z.
         # createStraightPointsList() is not needed for this input.
-        prepared = Utils.createStraightPointsList(track, rel)
+        prepared = list(Utils.createStraightPointsList(track, rel))
+        if len(prepared) != 9 * len(pts):
+            raise ValueError(f"Unexpected point list length for {track_name}: {len(prepared)}")
+        for point_i, (_, _, z) in enumerate(pts):
+            for control_i in range(3):
+                prepared[point_i * 9 + control_i * 3 + 2] = z - z0
         print(f"SETTING POINTS {track_name} ({len(pts)} vertices)", flush=True)
         track.setPointList(prepared)
         print(f"POINTS SET {track_name}", flush=True)

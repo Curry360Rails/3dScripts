@@ -3,88 +3,35 @@ import json
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-polygon = [
-  {
-    "lat": 34.4980686189572,
-    "lng": -117.30033874511719
-  },
-  {
-    "lat": 34.496370914707285,
-    "lng": -117.25982666015626
-  },
-  {
-    "lat": 34.53433110273239,
-    "lng": -117.26428985595705
-  },
-  {
-    "lat": 34.57222098601774,
-    "lng": -117.26291656494142
-  },
-  {
-    "lat": 34.60105097018313,
-    "lng": -117.18738555908205
-  },
-  {
-    "lat": 34.59596405277047,
-    "lng": -117.10292816162111
-  },
-  {
-    "lat": 34.62704590420544,
-    "lng": -117.07889556884767
-  },
-  {
-    "lat": 34.6428649215081,
-    "lng": -117.1084213256836
-  },
-  {
-    "lat": 34.636650667365934,
-    "lng": -117.12902069091797
-  },
-  {
-    "lat": 34.62987094998342,
-    "lng": -117.15167999267578
-  },
-  {
-    "lat": 34.63100094136006,
-    "lng": -117.18601226806642
-  },
-  {
-    "lat": 34.628175934059875,
-    "lng": -117.24163055419923
-  },
-  {
-    "lat": 34.60331172236259,
-    "lng": -117.29244232177736
-  },
-  {
-    "lat": 34.593137852926574,
-    "lng": -117.30823516845705
-  },
-  {
-    "lat": 34.639475386064426,
-    "lng": -117.3274612426758
-  },
-  {
-    "lat": 34.635520752949176,
-    "lng": -117.35698699951173
-  },
-  {
-    "lat": 34.58013609530447,
-    "lng": -117.34874725341798
-  },
-  {
-    "lat": 34.552429915988604,
-    "lng": -117.32677459716798
-  }
-]
+# The project boundary is shared with the 3DEP and NAIP download stages.
+import argparse
 
-# poly_string = " ".join(
-#     f"{lat} {lon}" for lat, lon in polygon
-# )
+def load_polygon(path):
+    data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if data.get("type") == "FeatureCollection":
+        features = data.get("features", [])
+        if len(features) != 1:
+            raise ValueError("Boundary must contain exactly one polygon feature")
+        data = features[0]["geometry"]
+    elif data.get("type") == "Feature":
+        data = data["geometry"]
+    if data.get("type") != "Polygon":
+        raise ValueError("Boundary must be a GeoJSON Polygon in WGS84")
+    ring = data["coordinates"][0]
+    if len(ring) < 4:
+        raise ValueError("Boundary polygon requires at least three vertices")
+    if ring[0] == ring[-1]:
+        ring = ring[:-1]
+    for lon, lat, *_ in ring:
+        if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+            raise ValueError("Invalid longitude/latitude in boundary")
+    return ring
 
-poly_string = " ".join(
-    f"{point['lat']} {point['lng']}" for point in polygon
-)
+parser = argparse.ArgumentParser(description="Download OSM railways for a GeoJSON boundary")
+parser.add_argument("--boundary", type=Path, default=Path(__file__).resolve().with_name("boundary.geojson"))
+args = parser.parse_args()
+polygon = load_polygon(args.boundary)
+poly_string = " ".join(f"{lat} {lon}" for lon, lat, *_ in polygon)
 
 url = "https://overpass-api.de/api/interpreter"
 
