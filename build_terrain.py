@@ -108,6 +108,103 @@ def resolve_raster_input(value, kind, output, target_crs=None, refresh=False):
     return str(dst), [str(x) for x in paths]
 
 
+
+class VirtualImagery:
+    """On-demand virtual mosaic: source TIFFs stay untouched on disk.
+
+    Each source is opened as a GDAL-backed Rasterio WarpedVRT in the DEM CRS.
+    Only source footprints intersecting a requested output window are read.
+    First source with valid data wins, matching the old merge(method='first').
+    """
+    def __init__(self, sources, target_crs):
+        from rasterio.warp import transform_bounds
+        self.sources = [str(Path(p).resolve()) for p in sources]
+        self.crs = target_crs
+        self.stack = ExitStack()
+        self.items = []
+        try:
+            for path in tqdm(self.sources, desc='Indexing virtual imagery', unit='file'):
+                ds = self.stack.enter_context(rasterio.open(path))
+                if ds.crs is None or ds.count < 3:
+                    raise ValueError(f'Imagery needs a CRS and at least 3 bands: {path}')
+                vrt = self.stack.enter_context(WarpedVRT(
+                    ds, crs=target_crs, resampling=Resampling.bilinear,
+                    src_nodata=ds.nodata))
+                # Use the source footprint, not the large full virtual grid.
+                footprint = transform_bounds(ds.crs, target_crs, *ds.bounds, densify_pts=21)
+                self.items.append((vrt, footprint))
+        except Exception:
+            self.stack.close()
+            raise
+
+    def close(self):
+        self.stack.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def render(self, bounds, width, height):
+        from rasterio.windows import from_bounds as window_from_bounds
+        from rasterio.windows import Window
+        from rasterio.enums import Resampling as R
+        xmin, ymin, xmax, ymax = bounds
+        result = np.zeros((height, width, 3), dtype=np.uint8)
+        filled = np.zeros((height, width), dtype=bool)
+        for vrt, (left, bottom, right, top) in self.items:
+            if right <= xmin or left >= xmax or top <= ymin or bottom >= ymax:
+                continue
+            window = window_from_bounds(xmin, ymin, xmax, ymax, transform=vrt.transform)
+            # Boundless reads are not supported by WarpedVRT in some Rasterio builds;
+            # clip to the VRT extent and copy the relevant output pixel rectangle.
+            x0 = max(0, int(math.floor((max(xmin, left) - xmin) / (xmax-xmin) * width)))
+            x1 = min(width, int(math.ceil((min(xmax, right) - xmin) / (xmax-xmin) * width)))
+            y0 = max(0, int(math.floor((ymax - min(ymax, top)) / (ymax-ymin) * height)))
+            y1 = min(height, int(math.ceil((ymax - max(ymin, bottom)) / (ymax-ymin) * height)))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            sub_bounds = (
+                xmin + x0*(xmax-xmin)/width,
+                ymax - y1*(ymax-ymin)/height,
+                xmin + x1*(xmax-xmin)/width,
+                ymax - y0*(ymax-ymin)/height,
+            )
+            subwindow = window_from_bounds(*sub_bounds, transform=vrt.transform)
+            data = vrt.read(indexes=[1,2,3], window=subwindow,
+                            out_shape=(3,y1-y0,x1-x0),
+                            resampling=R.bilinear, masked=True)
+            mask = ~np.ma.getmaskarray(data).any(axis=0)
+            # Explicit dataset mask guards against missing NoData metadata.
+            source_mask = vrt.read_masks(1, window=subwindow,
+                                         out_shape=(y1-y0,x1-x0),
+                                         resampling=R.nearest) > 0
+            mask &= source_mask
+            free = mask & ~filled[y0:y1, x0:x1]
+            if free.any():
+                patch = result[y0:y1, x0:x1]
+                patch[free] = np.moveaxis(np.asarray(data.filled(0)),0,-1)[free]
+                filled[y0:y1, x0:x1][free] = True
+            if filled.all():
+                break
+        return result
+
+
+def resolve_imagery_virtual(value, target_crs):
+    """Return TIFF paths without ever writing an imagery mosaic."""
+    path = Path(value).expanduser().resolve()
+    if path.is_file() and path.suffix.lower() in ('.tif', '.tiff'):
+        sources = [path]
+    elif path.is_dir():
+        sources = sorted(p for p in path.rglob('*') if p.is_file() and p.suffix.lower() in ('.tif', '.tiff'))
+    else:
+        raise FileNotFoundError(f'Imagery TIFF or folder not found: {path}')
+    if not sources:
+        raise ValueError(f'No imagery TIFFs found under {path}')
+    print(f'Using {len(sources)} source imagery TIFFs via on-demand WarpedVRT (no physical mosaic)', flush=True)
+    return [str(p) for p in sources]
+
 def load_lines(path, layers, target_crs, preserve_original_crs=False):
     import pyogrio
     from pyogrio.raw import read as read_raw
@@ -427,7 +524,7 @@ def _clip_batch(batch):
     return results
 
 
-def export_corridor_tiled(out, dem, imagery_path, bounds, keys, elevations, valid,
+def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, valid,
                           faces, step, base, corridor, resolution, tile_pixels,
                           workers=1, clip_batch_size=4000):
     """Clip faces in batches; avoid intersections for interior faces; parallel on request."""
@@ -458,8 +555,7 @@ def export_corridor_tiled(out, dem, imagery_path, bounds, keys, elevations, vali
     textures=out/'textures'; textures.mkdir(exist_ok=True)
     material_lines=[]
     vertex_index=0
-    with rasterio.open(imagery_path) as imagery:
-        if imagery.crs is None: raise ValueError('Imagery has no CRS')
+    with VirtualImagery(imagery_sources, dem.crs) as imagery:
         with (out/'terrain.obj').open('w',encoding='utf8',buffering=1024*1024) as obj:
             obj.write('mtllib terrain.mtl\n')
             for (ix,iy),pieces in tqdm(sorted(tile_polygons.items()),desc='Exporting texture tiles',unit='tile'):
@@ -467,14 +563,7 @@ def export_corridor_tiled(out, dem, imagery_path, bounds, keys, elevations, vali
                 tx1,ty1=min(tx0+tile_m,b.right),min(ty0+tile_m,b.top)
                 w=max(2,math.ceil((tx1-tx0)/resolution))
                 h=max(2,math.ceil((ty1-ty0)/resolution))
-                rgb=np.zeros((h,w,3),dtype=np.uint8)
-                dst_transform=from_bounds(tx0,ty0,tx1,ty1,w,h)
-                for ch in range(3):
-                    reproject(source=rasterio.band(imagery,min(ch+1,imagery.count)),
-                              destination=rgb[:,:,ch],src_transform=imagery.transform,
-                              src_crs=imagery.crs,src_nodata=imagery.nodata,
-                              dst_transform=dst_transform,dst_crs=dem.crs,dst_nodata=0,
-                              resampling=Resampling.bilinear)
+                rgb=imagery.render((tx0,ty0,tx1,ty1),w,h)
                 texname=f'corridor_{ix}_{iy}.png'
                 Image.fromarray(rgb).save(textures/texname)
                 mat=f'Corridor_{ix}_{iy}'
@@ -513,7 +602,7 @@ def main():
     p = argparse.ArgumentParser(description='Adaptive textured terrain OBJ refined around GeoPackage roads/railways')
     p.add_argument('--dem', required=True, help='DEM GeoTIFF or folder of DEM TIFFs')
     p.add_argument('--imagery', help='Imagery GeoTIFF or folder of imagery TIFFs (not required with --network-only)')
-    p.add_argument('--rebuild-mosaics', action='store_true', help='Force recreation of cached folder mosaics')
+    p.add_argument('--rebuild-mosaics', action='store_true', help='Force recreation of cached DEM mosaic (imagery is virtual)')
     p.add_argument('--gpkg', help='GPKG, raw Overpass OSM JSON, GeoJSON, or KML input (legacy flag)')
     p.add_argument('--network', help='Network vector file: .gpkg, .json, .geojson, or .kml')
     p.add_argument('--network-only', action='store_true', help='Export only network_lines.obj from vector source; skip terrain and imagery')
@@ -526,7 +615,7 @@ def main():
     p.add_argument('--transition-buffer', type=float, default=200)
     p.add_argument('--line-spacing', type=float, default=3)
     p.add_argument('--line-z-offset', type=float, default=0.5)
-    p.add_argument('--max-cells', type=int, default=2_000_000)
+    p.add_argument('--max-cells', type=int, default=5_000_000)
     p.add_argument('--max-texture', type=int, default=8192)
     p.add_argument('--base-elevation', type=float)
     p.add_argument('--workers', type=int, default=8, help='Clipping worker processes (1 disables multiprocessing)')
@@ -558,7 +647,7 @@ def main():
         imagery_path = None
         imagery_sources = []
         if not args.network_only:
-            imagery_path, imagery_sources = resolve_raster_input(args.imagery, 'imagery', out, target_crs=dem.crs, refresh=args.rebuild_mosaics)
+            imagery_sources = resolve_imagery_virtual(args.imagery, dem.crs)
         if dem.crs is None or not dem.crs.is_projected or 'met' not in (dem.crs.linear_units or '').lower():
             raise ValueError('DEM must use a projected CRS in meters')
         b = dem.bounds
@@ -634,24 +723,16 @@ def main():
             raise ValueError('No valid DEM elevations at mesh vertices')
         base = float(np.min(elevations[valid])) if args.base_elevation is None else args.base_elevation
         if args.corridor_only:
-            stats = export_corridor_tiled(out, dem, imagery_path, b, keys, elevations, valid, faces,
+            stats = export_corridor_tiled(out, dem, imagery_sources, b, keys, elevations, valid, faces,
                                           step, base, corridor, args.texture_resolution,
                                           args.texture_tile_size, args.workers, args.clip_batch_size)
             tw = th = 0
         else:
-            with rasterio.open(imagery_path) as imagery:
-                if imagery.crs is None:
-                    raise ValueError('Imagery has no CRS')
-                ratio = min(1,args.max_texture/max(imagery.width,imagery.height))
-                tw,th = max(2,round(imagery.width*ratio)),max(2,round(imagery.height*ratio))
-                dst_transform = from_bounds(b.left,b.bottom,b.right,b.top,tw,th)
-                rgb = np.zeros((th,tw,3),dtype=np.uint8)
-                for channel in tqdm(range(3), desc="Reprojecting imagery", unit="band"):
-                    reproject(source=rasterio.band(imagery,min(channel+1,imagery.count)),
-                              destination=rgb[:,:,channel],src_transform=imagery.transform,
-                              src_crs=imagery.crs,src_nodata=imagery.nodata,
-                              dst_transform=dst_transform,dst_crs=dem.crs,dst_nodata=0,
-                              resampling=Resampling.bilinear)
+            with VirtualImagery(imagery_sources, dem.crs) as imagery:
+                # Keep existing max-texture behavior without creating a source mosaic.
+                ratio = min(1.0, args.max_texture / max(dem.width, dem.height))
+                tw, th = max(2, round(dem.width*ratio)), max(2, round(dem.height*ratio))
+                rgb = imagery.render((b.left,b.bottom,b.right,b.top),tw,th)
             Image.fromarray(rgb).save(out/'terrain_texture.png')
             with (out/'terrain.obj').open('w',encoding='utf8') as f:
                 f.write('mtllib terrain.mtl\no Terrain\n')
@@ -682,7 +763,8 @@ def main():
             'texture_resolution_m_per_pixel':args.texture_resolution,
             'texture_tile_max_pixels':args.texture_tile_size,
             'clip_workers':args.workers,
-            'dem_sources':dem_sources, 'imagery_sources':imagery_sources
+            'dem_sources':dem_sources, 'imagery_sources':imagery_sources,
+            'imagery_mode':'on_demand_warped_vrt'
         },indent=2))
         print(f'Done: {out.resolve()} | source mesh {len(vertices):,} vertices, {len(faces):,} triangles' + (' | corridor tiles: '+str(stats['tiles']) if args.corridor_only else f' | texture {tw}x{th}'))
 
