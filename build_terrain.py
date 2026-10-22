@@ -19,6 +19,8 @@ from rasterio.transform import from_bounds
 from rasterio.warp import reproject, transform_geom, calculate_default_transform
 from rasterio.vrt import WarpedVRT
 from rasterio.merge import merge
+from glb_writer import StreamingGLB
+from pipeline_cache import fingerprint, inventory
 from contextlib import ExitStack
 
 from shapely.geometry import LineString, MultiLineString, GeometryCollection, box, Polygon
@@ -30,83 +32,57 @@ from shapely.geometry import shape
 
 
 def resolve_raster_input(value, kind, output, target_crs=None, refresh=False):
-    """Accept one TIFF or a folder of TIFFs; build a disk-backed mosaic if needed.
-
-    A folder is searched recursively. The DEM establishes the target CRS;
-    imagery is warped into that CRS so all source tiles align.
-    """
-    path = Path(value).expanduser().resolve()
-    if path.is_file():
-        return str(path), [str(path)]
-    if not path.is_dir():
-        raise FileNotFoundError(f"{kind} input not found: {path}")
-    paths = sorted(p for p in path.rglob('*') if p.is_file() and p.suffix.lower() in ('.tif', '.tiff'))
-    if not paths:
-        raise ValueError(f"No TIFFs found in {kind} directory: {path}")
-    print(f"Found {len(paths)} {kind} TIFF(s) in {path}", flush=True)
-    if len(paths) == 1:
-        return str(paths[0]), [str(paths[0])]
-    cache = output / '_raster_mosaics'
-    cache.mkdir(parents=True, exist_ok=True)
-    dst = cache / ('dem_mosaic.tif' if kind == 'DEM' else 'imagery_mosaic.tif')
-    # Avoid accidentally reusing a mosaic from a different source directory.
+    """Virtual DEM mosaic: original source TIFFs remain untouched."""
+    from xml.etree import ElementTree as ET
     import hashlib
-    fingerprint = hashlib.sha256(('\n'.join(str(x) for x in paths) + '|' + str(target_crs)).encode()).hexdigest()
-    stamp = dst.with_suffix('.sources.json')
-    latest = max(x.stat().st_mtime for x in paths)
-    if (not refresh and dst.exists() and stamp.exists()
-            and dst.stat().st_mtime >= latest):
-        try:
-            if json.loads(stamp.read_text())['fingerprint'] == fingerprint:
-                print(f"Reusing cached {kind} mosaic: {dst}", flush=True)
-                return str(dst), [str(x) for x in paths]
-        except (ValueError, KeyError, OSError):
-            pass
-    temp = dst.with_name(dst.stem + '.partial.tif')
-    temp.unlink(missing_ok=True)
+    path=Path(value).expanduser().resolve()
+    if path.is_file():return str(path),[str(path)]
+    if not path.is_dir():raise FileNotFoundError(path)
+    paths=sorted(p for p in path.rglob('*') if p.suffix.lower() in ('.tif','.tiff'))
+    if not paths:raise ValueError(f'No {kind} TIFFs in {path}')
+    if len(paths)==1:return str(paths[0]),[str(paths[0])]
+    if kind!='DEM':raise ValueError('Imagery uses resolve_imagery_virtual instead')
+    from contextlib import ExitStack
     with ExitStack() as stack:
-        datasets = [stack.enter_context(rasterio.open(x)) for x in tqdm(paths, desc=f'Opening {kind} TIFFs', unit='file')]
-        if any(ds.crs is None for ds in datasets):
-            raise ValueError(f"Every {kind} TIFF must have a defined CRS")
-        if kind == 'DEM' and len({str(ds.crs) for ds in datasets}) != 1:
-            raise ValueError('DEM tiles must share a CRS; reproject differing DEM tiles before mosaicking')
-        crs = target_crs or datasets[0].crs
-        if kind == 'DEM':
-            sources = datasets
-            indexes = [1]
-            resolution = min(min(abs(ds.res[0]), abs(ds.res[1])) for ds in datasets)
-        else:
-            if any(ds.count < 3 for ds in datasets):
-                raise ValueError('All imagery TIFFs must have at least three bands (RGB)')
-            # Calculate native ground sample distance in target CRS.
-            resolutions = []
-            for ds in datasets:
-                if ds.crs == crs:
-                    resolutions.append(min(abs(ds.res[0]), abs(ds.res[1])))
-                else:
-                    _, _, w, h = calculate_default_transform(ds.crs, crs, ds.width, ds.height, *ds.bounds)
-                    from rasterio.warp import transform_bounds
-                    bb = transform_bounds(ds.crs, crs, *ds.bounds)
-                    resolutions.append(min((bb[2]-bb[0])/w, (bb[3]-bb[1])/h))
-            resolution = min(resolutions)
-            sources = [stack.enter_context(WarpedVRT(ds, crs=crs, resampling=Resampling.bilinear))
-                       if ds.crs != crs else ds for ds in datasets]
-            indexes = [1, 2, 3]
-        # Disk-backed rasterio merge avoids allocating the full mosaic in RAM.
-        print(f"Building {kind} mosaic at approximately {resolution:.3f} units/pixel in {crs}", flush=True)
+        ds=[stack.enter_context(rasterio.open(p)) for p in paths]
+        if any(x.crs is None for x in ds):raise ValueError('DEM CRS missing')
+        if len({str(x.crs) for x in ds})!=1:raise ValueError('Selected DEM tiles have different CRS')
+        if any(x.count<1 for x in ds):raise ValueError('DEM has no elevation band')
+        if any(abs(x.transform.b)>1e-9 or abs(x.transform.d)>1e-9 for x in ds):raise ValueError('Rotated DEM not supported')
+        rx,ry=abs(ds[0].res[0]),abs(ds[0].res[1]);ref=ds[0].transform
+        for x in ds[1:]:
+            if abs(abs(x.res[0])-rx)>1e-5 or abs(abs(x.res[1])-ry)>1e-5:
+                raise ValueError(f'DEM resolution mismatch: {x.name}')
+            if abs(((x.transform.c-ref.c)/rx)-round((x.transform.c-ref.c)/rx))>1e-4 or abs(((ref.f-x.transform.f)/ry)-round((ref.f-x.transform.f)/ry))>1e-4:
+                raise ValueError(f'DEM pixel grids not aligned: {x.name}')
+        left=min(x.bounds.left for x in ds);top=max(x.bounds.top for x in ds)
+        right=max(x.bounds.right for x in ds);bottom=min(x.bounds.bottom for x in ds)
+        w=round((right-left)/rx);h=round((top-bottom)/ry)
+        root=ET.Element('VRTDataset',rasterXSize=str(w),rasterYSize=str(h))
+        ET.SubElement(root,'SRS').text=ds[0].crs.to_wkt()
+        ET.SubElement(root,'GeoTransform').text=f'{left}, {rx}, 0, {top}, 0, {-ry}'
+        band=ET.SubElement(root,'VRTRasterBand',dataType='Float32',band='1')
+        nodata=ds[0].nodata if ds[0].nodata is not None else -9999
+        ET.SubElement(band,'NoDataValue').text=str(nodata)
+        for src,x in zip(paths,ds):
+            e=ET.SubElement(band,'ComplexSource')
+            ET.SubElement(e,'SourceFilename',relativeToVRT='0').text=str(src)
+            ET.SubElement(e,'SourceBand').text='1'
+            ET.SubElement(e,'SourceProperties',RasterXSize=str(x.width),RasterYSize=str(x.height),DataType='Float32',BlockXSize='256',BlockYSize='256')
+            ET.SubElement(e,'SrcRect',xOff='0',yOff='0',xSize=str(x.width),ySize=str(x.height))
+            ET.SubElement(e,'DstRect',xOff=str(round((x.bounds.left-left)/rx)),yOff=str(round((top-x.bounds.top)/ry)),xSize=str(x.width),ySize=str(x.height))
+            if x.nodata is not None:ET.SubElement(e,'NODATA').text=str(x.nodata)
+    cache=output/'_raster_mosaics';cache.mkdir(parents=True,exist_ok=True)
+    dst=cache/'dem_mosaic.vrt';stamp=cache/'dem_mosaic.sources.json'
+    signature=hashlib.sha256(json.dumps([(str(x),x.stat().st_size,x.stat().st_mtime_ns) for x in paths]).encode()).hexdigest()
+    if not refresh and dst.exists() and stamp.exists():
         try:
-            merge(sources, res=resolution, indexes=indexes, method='first',
-                  resampling=Resampling.nearest if kind == 'DEM' else Resampling.bilinear,
-                  mem_limit=128, dst_path=str(temp),
-                  dst_kwds={'driver': 'GTiff', 'compress': 'deflate', 'BIGTIFF': 'IF_SAFER', 'tiled': True, 'blockxsize': 256, 'blockysize': 256})
-            temp.replace(dst)
-        except Exception:
-            temp.unlink(missing_ok=True)
-            raise
-    stamp.write_text(json.dumps({'fingerprint': fingerprint, 'sources': [str(x) for x in paths]}, indent=2))
-    print(f"Created {kind} mosaic: {dst}", flush=True)
-    return str(dst), [str(x) for x in paths]
-
+            if json.loads(stamp.read_text())['signature']==signature:return str(dst),list(map(str,paths))
+        except (OSError,ValueError,KeyError):pass
+    temp=dst.with_suffix('.partial.vrt');ET.ElementTree(root).write(temp,encoding='utf-8',xml_declaration=True);temp.replace(dst)
+    stamp.write_text(json.dumps({'signature':signature},indent=2))
+    print(f'Virtual DEM mosaic: {len(paths)} TIFFs -> {dst}',flush=True)
+    return str(dst),list(map(str,paths))
 
 
 class VirtualImagery:
@@ -632,7 +608,7 @@ def _clip_batch(batch):
 
 def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, valid,
                           faces, step, base, corridor, resolution, tile_pixels,
-                          workers=1, clip_batch_size=4000, texture_scale=1.0):
+                          workers=1, clip_batch_size=4000, texture_scale=1.0, output_format="glb", texture_cache=None):
     """Clip faces in batches; avoid intersections for interior faces; parallel on request."""
     from shapely import to_wkb
     b=bounds
@@ -659,22 +635,41 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
     if not tile_polygons:
         raise ValueError('No valid corridor terrain faces. Check DEM coverage and corridor location.')
     textures=out/'textures'; textures.mkdir(exist_ok=True)
+    is_glb=output_format=='glb'
+    glb=StreamingGLB(out/'terrain.glb') if is_glb else None
+    texture_cache=Path(texture_cache or (out/'texture_cache'));texture_cache.mkdir(parents=True,exist_ok=True)
+    source_signature=fingerprint(inventory(imagery_sources[0]) if len(imagery_sources)==1 else [inventory(p) for p in imagery_sources])
+    hits=misses=0
     material_lines=[]
     vertex_index=0
     with VirtualImagery(imagery_sources, dem.crs) as imagery:
-        with (out/'terrain.obj').open('w',encoding='utf8',buffering=1024*1024) as obj:
-            obj.write('mtllib terrain.mtl\n')
+        with ((out/'terrain.obj').open('w',encoding='utf8',buffering=1024*1024) if not is_glb else __import__('contextlib').nullcontext(None)) as obj:
+            if obj:obj.write('mtllib terrain.mtl\n')
             for (ix,iy),pieces in tqdm(sorted(tile_polygons.items()),desc='Exporting texture tiles',unit='tile'):
                 tx0,ty0=x0+ix*tile_m,y0+iy*tile_m
                 tx1,ty1=min(tx0+tile_m,b.right),min(ty0+tile_m,b.top)
                 w=max(2,math.ceil((tx1-tx0)/resolution*texture_scale))
                 h=max(2,math.ceil((ty1-ty0)/resolution*texture_scale))
-                rgb=imagery.render((tx0,ty0,tx1,ty1),w,h)
+                cache_key=fingerprint([source_signature,tx0,ty0,tx1,ty1,w,h,str(dem.crs)])
+                cache_file=texture_cache/(cache_key+'.png')
+                if cache_file.exists():
+                    try:
+                        with Image.open(cache_file) as cached:
+                            if cached.size!=(w,h):raise ValueError('Texture dimensions changed')
+                            rgb=np.array(cached.convert('RGB'))
+                        hits+=1
+                    except (OSError,ValueError):cache_file.unlink(missing_ok=True)
+                if not cache_file.exists():
+                    rgb=imagery.render((tx0,ty0,tx1,ty1),w,h)
+                    temp=cache_file.with_suffix('.partial.png');Image.fromarray(rgb).save(temp);temp.replace(cache_file)
+                    misses+=1
                 texname=f'corridor_{ix}_{iy}.png'
-                Image.fromarray(rgb).save(textures/texname)
+                if not is_glb:Image.fromarray(rgb).save(textures/texname)
                 mat=f'Corridor_{ix}_{iy}'
-                material_lines.append(f'newmtl {mat}\nKd 1 1 1\nmap_Kd textures/{texname}\n')
-                obj.write(f'o Tile_{ix}_{iy}\nusemtl {mat}\n')
+                if obj:
+                    material_lines.append(f'newmtl {mat}\nKd 1 1 1\nmap_Kd textures/{texname}\n')
+                    obj.write(f'o Tile_{ix}_{iy}\nusemtl {mat}\n')
+                tile_vertices=[];tile_uv=[]
                 for part,ids in pieces:
                     a,c,d=ids
                     xA,yA=xy[a-1];xB,yB=xy[c-1];xC,yC=xy[d-1]
@@ -695,17 +690,26 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
                             z=wa*elevations[a-1]+wb*elevations[c-1]+wc*elevations[d-1]
                             u=(x-tx0)/(tx1-tx0)
                             v=(y-ty0)/(ty1-ty0)
-                            obj.write(f'v {x-x0:.5f} {y-y0:.5f} {z-base:.5f}\n')
-                            obj.write(f'vt {u:.9f} {v:.9f}\n')
-                        obj.write(f'f {vertex_index+1}/{vertex_index+1} {vertex_index+2}/{vertex_index+2} {vertex_index+3}/{vertex_index+3}\n')
+                            if is_glb:
+                                tile_vertices.append((x-x0,y-y0,z-base));tile_uv.append((u,1-v))
+                            else:
+                                obj.write(f'v {x-x0:.5f} {y-y0:.5f} {z-base:.5f}\n')
+                                obj.write(f'vt {u:.9f} {v:.9f}\n')
+                        if obj:obj.write(f'f {vertex_index+1}/{vertex_index+1} {vertex_index+2}/{vertex_index+2} {vertex_index+3}/{vertex_index+3}\n')
                         vertex_index+=3
-    (out/'terrain.mtl').write_text('\n'.join(material_lines),encoding='utf8')
+                if glb:glb.add_tile(mat,tile_vertices,tile_uv,Image.fromarray(rgb))
+    if glb:glb.finish()
+    else:(out/'terrain.mtl').write_text('\n'.join(material_lines),encoding='utf8')
+    print(f'Texture cache: {hits} hits, {misses} misses',flush=True)
     print(f'Corridor export: {len(tile_polygons):,} texture tiles, {vertex_index:,} OBJ vertices',flush=True)
     return {'tiles':len(tile_polygons),'vertices':vertex_index}
 
 
 def main():
     p = argparse.ArgumentParser(description='Adaptive textured terrain OBJ refined around GeoPackage roads/railways')
+    p.add_argument('--format', choices=['glb','obj'],default='glb')
+    p.add_argument('--texture-cache')
+    p.add_argument('--mesh-mode',choices=['adaptive','full','flat'],default='adaptive')
     p.add_argument('--dem', required=True, help='DEM GeoTIFF or folder of DEM TIFFs')
     p.add_argument('--imagery', help='Imagery GeoTIFF or folder of imagery TIFFs (not required with --network-only)')
     p.add_argument('--rebuild-mosaics', action='store_true', help='Force recreation of cached DEM mosaic (imagery is virtual)')
@@ -811,6 +815,10 @@ def main():
                 if not polys: raise ValueError('No polygonal corridor inside DEM')
                 corridor = max(polys, key=lambda g: g.area)
             print(f'Corridor area: {corridor.area / 1e6:.3f} km2', flush=True)
+        if args.mesh_mode=='full':
+            args.near_spacing=args.transition_spacing=args.background_spacing=min(abs(dem.res[0]),abs(dem.res[1]))
+            args.max_elevation_error=None
+            print('FULL mode: native DEM cell size; check --max-cells and available RAM',flush=True)
         cells,step = build_cells((b.left,b.bottom,b.right,b.top),tree,args.near_spacing,
                                  args.transition_spacing,args.background_spacing,
                                  args.fine_buffer,args.transition_buffer,args.max_cells,
@@ -828,12 +836,14 @@ def main():
         if not valid.any():
             raise ValueError('No valid DEM elevations at mesh vertices')
         base = float(np.min(elevations[valid])) if args.base_elevation is None else args.base_elevation
+        if args.mesh_mode=='flat':elevations[valid]=base
         if args.corridor_only:
             stats = export_corridor_tiled(out, dem, imagery_sources, b, keys, elevations, valid, faces,
                                           step, base, corridor, args.texture_resolution,
-                                          args.texture_tile_size, args.workers, args.clip_batch_size, args.texture_scale)
+                                          args.texture_tile_size, args.workers, args.clip_batch_size, args.texture_scale, args.format,args.texture_cache)
             tw = th = 0
         else:
+            if args.format=='glb':raise ValueError('Direct GLB currently requires --corridor-only')
             with VirtualImagery(imagery_sources, dem.crs) as imagery:
                 # Keep existing max-texture behavior without creating a source mosaic.
                 ratio = min(1.0, args.max_texture / max(dem.width, dem.height))

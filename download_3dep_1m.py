@@ -125,6 +125,10 @@ def safe_name(url, item, index):
 def download(s, item, out, index, overwrite=False):
     url = item['downloadURL']
     dest = out / safe_name(url, item, index)
+    extracted=out / dest.stem
+    if extracted.is_dir() and any(q.suffix.lower() in ('.tif','.tiff') for q in extracted.rglob('*')) and not overwrite:
+        print(f'Skipping already extracted product: {dest.stem}')
+        return None
     if dest.exists() and dest.stat().st_size > 0 and not overwrite:
         print(f'Skipping existing: {dest.name}')
         return dest
@@ -205,7 +209,7 @@ def main():
         for i, item in enumerate(products, 1):
             try:
                 path = download(session, item, out, i, args.overwrite)
-                if args.extract:
+                if args.extract and path is not None:
                     extract_zip(path, out)
             except (requests.RequestException, OSError, zipfile.BadZipFile) as exc:
                 print(f'WARNING: failed product {i}: {exc}', file=sys.stderr)

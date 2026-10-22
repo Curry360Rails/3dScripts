@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
+from pipeline_cache import Cache, fingerprint, inventory
 
 ROOT = Path(__file__).resolve().parent
 
@@ -51,6 +53,13 @@ def polygon_bbox(path):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--project-name',help='Override boundary filename project name')
+    p.add_argument('--fresh',action='store_true',help='Use isolated new project resources and bypass existing cache')
+    p.add_argument('--force-rebuild',action='store_true',help='Regenerate terrain stage')
+    p.add_argument('--refresh-searches',action='store_true',help='Refresh OSM/USGS API searches')
+    p.add_argument('--format',choices=['glb','obj'],default='glb')
+    p.add_argument('--mesh-mode',choices=['adaptive','flat','full'],default='adaptive')
+    p.add_argument('--cache-ttl-days',type=int,default=7)
     p.add_argument('--all', action='store_true', help='Run OSM, DEM, NAIP, terrain and Blender; AnyLogic requires --import-anylogic')
     for stage in ('osm', 'dem', 'naip', 'terrain', 'blender', 'anylogic'):
         p.add_argument('--' + stage, action='store_true', help='Run only this stage (combine flags as desired)')
@@ -77,7 +86,8 @@ def main():
     args = p.parse_args()
     selected = {name for name in ('osm', 'dem', 'naip', 'terrain', 'blender', 'anylogic') if getattr(args, name)}
     if args.all:
-        selected.update(('osm', 'dem', 'naip', 'terrain', 'blender'))
+        selected.update(('osm', 'dem', 'naip', 'terrain'))
+        if args.format=='obj':selected.add('blender')
         if args.import_anylogic:
             selected.add('anylogic')
     if not selected:
@@ -88,57 +98,60 @@ def main():
         p.error('Worker counts must be positive')
     if not (0 < args.ratio <= 1 and 0 < args.texture_scale <= 1 and args.model_units_per_meter > 0):
         p.error('Invalid ratio, texture scale, or model scale')
-    out = (ROOT / args.output).resolve()
-    dem_dir = (ROOT / args.dem_folder).resolve()
-    naip_dir = (ROOT / args.naip_folder).resolve()
-    osm_json = (ROOT / args.osm_json).resolve()
     boundary = (ROOT / args.boundary).resolve()
-    if not args.dry_run and any(k in selected for k in ('osm', 'dem', 'naip')):
-        check_file(boundary, 'Shared boundary GeoJSON')
-    def stage(label, cmd):
+    project = args.project_name or boundary.stem
+    if not project or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in project):
+        p.error('Invalid project name')
+    if args.fresh:
+        from datetime import datetime,timezone
+        project += '_fresh_' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')
+    def scoped(name):
+        path=(ROOT/name).resolve()
+        return path/project
+    out=scoped(args.output);dem_dir=scoped(args.dem_folder);naip_dir=scoped(args.naip_folder)
+    osm_json=scoped('osm_output')/'railway_raw_osm.json'
+    cache=Cache(scoped('pipeline_cache')/'pipeline_cache.sqlite') if not args.dry_run else None
+    def stage(label,cmd,kind,inputs,outputs,force=False,ttl=None):
+        signature=fingerprint([kind,[str(x) for x in cmd[2:]],[(str(x),inventory(x)) for x in inputs],
+                               int(time.time()//(ttl*86400)) if ttl else None])
         if args.dry_run:
-            print(f'[DRY RUN] {label}:', ' '.join(map(str, cmd)), flush=True)
-        else:
-            run(label, cmd)
+            print('[DRY RUN]',label, ' '.join(map(str,cmd)));return
+        if not (args.fresh or force or args.refresh_searches and ttl) and cache.valid(kind,signature,outputs):
+            print(f'[CACHE HIT] {label}');return
+        print(f'[CACHE MISS] {label}')
+        run(label,cmd)
+        if not all(Path(x).exists() for x in outputs):
+            raise RuntimeError(f'{label} completed without expected outputs: {outputs}')
+        cache.record(kind,signature,outputs)
     if 'osm' in selected:
-        stage('Download Overpass railway geometry', [sys.executable, ROOT / 'overpassQuery.py', '--boundary', boundary])
+        stage('Download Overpass railway geometry', [sys.executable, ROOT/'overpassQuery.py','--boundary',boundary,'--output',osm_json.parent],
+              'osm',[boundary],[osm_json],ttl=args.cache_ttl_days)
     if 'dem' in selected:
-        if not args.dry_run: check_file(boundary, 'Boundary polygon')
-        stage('Download 3DEP DEMs', [sys.executable, ROOT / 'download_3dep_1m.py',
-              '--geojson', boundary, '--download', '--extract', '--output', dem_dir])
+        stage('Download 3DEP DEMs', [sys.executable,ROOT/'download_3dep_1m.py','--geojson',boundary,'--download','--extract','--output',dem_dir],
+              'dem',[boundary],[dem_dir/'products.json'],ttl=args.cache_ttl_days)
     if 'naip' in selected:
-        if not args.dry_run:
-            check_file(boundary, 'Boundary polygon')
-            bbox = polygon_bbox(boundary)
-        else:
-            bbox = ('WEST', 'SOUTH', 'EAST', 'NORTH')
-        stage('Download latest NAIP scenes', [sys.executable, ROOT / 'runM2M_NAIP.py',
-              '--bbox', *bbox, '--start', args.start_date, '--end', args.end_date,
-              '--workers', args.naip_workers, '--output', naip_dir])
+        bbox=polygon_bbox(boundary) if not args.dry_run else ('WEST','SOUTH','EAST','NORTH')
+        stage('Download NAIP imagery',[sys.executable,ROOT/'runM2M_NAIP.py','--bbox',*bbox,'--start',args.start_date,'--end',args.end_date,
+             '--workers',args.naip_workers,'--output',naip_dir], 'naip',[boundary],[naip_dir],ttl=args.cache_ttl_days)
     if 'terrain' in selected:
         if not args.dry_run:
-            check_tifs(dem_dir, 'DEM')
-            check_tifs(naip_dir, 'NAIP imagery')
-            check_file(osm_json, 'Raw OSM JSON')
-        stage('Build adaptive terrain', [sys.executable, ROOT / 'build_terrain.py',
-              '--dem', dem_dir, '--imagery', naip_dir, '--network', osm_json,
-              '--corridor-only', '--corridor-width', args.corridor_width,
-              '--near-spacing', 3, '--transition-spacing', 10, '--background-spacing', 70,
-              '--fine-buffer', 50, '--transition-buffer', 200,
-              '--texture-resolution', args.texture_resolution,
-              '--texture-tile-size', args.texture_tile_size,
-              '--workers', args.workers, '--output', out])
+            check_tifs(dem_dir,'DEM');check_tifs(naip_dir,'NAIP imagery');check_file(osm_json,'OSM')
+        cmd=[sys.executable,ROOT/'build_terrain.py','--dem',dem_dir,'--imagery',naip_dir,'--network',osm_json,
+             '--corridor-only','--corridor-width',args.corridor_width,'--near-spacing',3,'--transition-spacing',10,
+             '--background-spacing',70,'--fine-buffer',50,'--transition-buffer',200,
+             '--texture-resolution',args.texture_resolution,'--texture-tile-size',args.texture_tile_size,
+             '--texture-scale',args.texture_scale,'--workers',args.workers,'--format',args.format,
+             '--mesh-mode',args.mesh_mode,'--texture-cache',out/'texture_cache','--output',out]
+        stage('Build terrain',cmd,'terrain',[dem_dir,naip_dir,osm_json],
+              [out/('terrain.glb' if args.format=='glb' else 'terrain.obj'),out/'georeference.json'],force=args.force_rebuild)
     if 'blender' in selected:
-        if not args.dry_run:
-            check_file(out / 'terrain.obj', 'Terrain OBJ')
-            check_file(args.blender_exe, 'Blender executable')
-        stage('Optimize terrain and export GLB (no baking)', [args.blender_exe,
-              '--background', '--factory-startup', '--python', ROOT / 'blender_terrain_to_glb.py', '--',
-              '--input', out / 'terrain.obj', '--output', out / 'terrain_optimized.glb',
-              '--ratio', args.ratio, '--texture-scale', args.texture_scale,
-              '--merge-distance', '0.0001'])
+        if not args.dry_run:check_file(out/'terrain.obj','Terrain OBJ')
+        stage('Blender optimization',[args.blender_exe,'--background','--factory-startup','--python',ROOT/'blender_terrain_to_glb.py','--',
+              '--input',out/'terrain.obj','--output',out/'terrain_optimized.glb','--ratio',args.ratio,
+              '--texture-scale',args.texture_scale,'--merge-distance','0.0001'],
+              'blender',[out/'terrain.obj',out/'terrain.mtl',out/'textures'],[out/'terrain_optimized.glb'])
     if 'anylogic' in selected:
-        rail_script = ROOT / 'buildAnylogicRailNetwork_osm_dem_scaled_fixedz.py'
+        rail_script = ROOT / 'buildAnylogicRailNetwork.py'
         if not args.dry_run:
             check_file(rail_script, '3D AnyLogic importer')
             check_file(osm_json, 'Raw OSM JSON')
@@ -151,7 +164,7 @@ def main():
             spec.loader.exec_module(module)
             module.DATA_DIR = out
             module.OSM_JSON = osm_json
-            module.DEM_MOSAIC = out / '_raster_mosaics' / 'dem_mosaic.tif'
+            module.DEM_MOSAIC = out / '_raster_mosaics' / 'dem_mosaic.vrt'
             module.DEM_FOLDER = dem_dir
             module.TERRAIN_GEOREFERENCE = out / 'georeference.json'
             module.MODEL_NAME = args.model_name

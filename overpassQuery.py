@@ -28,6 +28,7 @@ def load_polygon(path):
     return ring
 
 parser = argparse.ArgumentParser(description="Download OSM railways for a GeoJSON boundary")
+parser.add_argument("--output",type=Path,default=Path("osm_output"))
 parser.add_argument("--boundary", type=Path, default=Path(__file__).resolve().with_name("boundary.geojson"))
 args = parser.parse_args()
 polygon = load_polygon(args.boundary)
@@ -66,7 +67,7 @@ if response.status_code != 200:
     response.raise_for_status()
 data = response.json()
 
-output = Path("osm_output")
+output = args.output
 output.mkdir(parents=True, exist_ok=True)
 
 # Keep the complete Overpass response, including untagged nodes needed by ways.
