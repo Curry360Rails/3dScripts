@@ -27,7 +27,7 @@ def _height_near(record, xy):
     return best
 
 
-def group_crossings(records, width=6., gap=3., vertical_tolerance=1.):
+def group_crossings(records, width=6., gap=3., vertical_tolerance=float("inf"), parallel_angle=15.):
     candidates=[]
     for r in records:
         pts=r.get('profile_xyz',[])
@@ -57,7 +57,15 @@ def group_crossings(records, width=6., gap=3., vertical_tolerance=1.):
             p,q=nearest_points(line,ll)
             _,za=_height_near(r,(p.x,p.y))
             _,zb=_height_near(rr,(q.x,q.y))
-            if abs(za-zb)<=vertical_tolerance:join(i,j)
+            # Compare overall directions modulo 180 degrees (parallel or anti-parallel).
+            def axis(line):
+                a,b=line.coords[0],line.coords[-1]
+                dx,dy=b[0]-a[0],b[1]-a[1]
+                d=math.hypot(dx,dy)
+                return (dx/d,dy/d) if d>1e-9 else (0,0)
+            u,v=axis(line),axis(ll)
+            parallel=abs(u[0]*v[0]+u[1]*v[1])>=math.cos(math.radians(parallel_angle))
+            if parallel and (not math.isfinite(vertical_tolerance) or abs(za-zb)<=vertical_tolerance):join(i,j)
     components={}
     for i in range(n):components.setdefault(find(i),[]).append(i)
     groups=[]
@@ -91,34 +99,58 @@ def save_groups(output,groups,crs):
         'features':features},indent=2),encoding='utf-8')
 
 
+def _deck_height(xy, members):
+    """Interpolate laterally between tracks, retaining longitudinal Z gradients.
+
+    Nearest centerline wins at its own XY; away from rails use inverse-square
+    lateral weighting of the projected profile elevations. Do not filter by Z:
+    doing so artificially forces one side of the deck to the other side's level.
+    """
+    nearby=sorted((_height_near(r,xy) for r in members),key=lambda v:v[0])
+    if not nearby:
+        raise ValueError('Deck group has no elevation profiles')
+    if nearby[0][0]<1e-6:
+        return nearby[0][1]
+    nearby=nearby[:min(4,len(nearby))]
+    weights=[1.0/(d+0.25)**2 for d,_ in nearby]
+    return sum(w*z for w,(_,z) in zip(weights,nearby))/sum(weights)
+
+
 def append_group_decks(glb,groups,imagery,bounds,base,resolution,max_texture_px=2048):
+    """One polygon per group, with constrained rail vertices and distinct side Z."""
     from tqdm.auto import tqdm
+    from shapely.geometry import GeometryCollection, MultiPoint
     count=0
     for g in tqdm(groups,desc='Exporting grouped crossing decks',unit='group'):
         poly=g['footprint'].simplify(0.3,preserve_topology=True)
-        # Clip Delaunay triangles to the unified footprint, so no overlapping
-        # strips are exported. Avoid holes and stray triangles outside footprint.
-        triangles=[tri for tri in constrained_delaunay_triangles(poly).geoms
-                   if tri.area>1e-8]
+        if poly.is_empty:continue
+        # Add rail profile vertices to the triangulation, including endpoints.
+        # This makes the corrected track elevation an explicit mesh vertex,
+        # rather than evaluating only the perimeter of the deck polygon.
+        interior=[]
+        for member in g['members']:
+            for x,y,z in member['profile_xyz']:
+                pt=Point(x,y)
+                if poly.covers(pt):interior.append((x,y))
+        # Unconstrained triangulation of boundary + interior control points;
+        # retain only triangles covered by the merged polygon (respect holes).
+        seeds=GeometryCollection([poly,MultiPoint(interior)]) if interior else poly
+        triangles=[tri for tri in triangulate(seeds) if tri.area>1e-8 and poly.covers(tri)]
+        if not triangles:
+            triangles=[tri for tri in constrained_delaunay_triangles(poly).geoms if tri.area>1e-8 and poly.covers(tri)]
         if not triangles:continue
         xmin,ymin,xmax,ymax=poly.bounds
         w=min(max_texture_px,max(2,math.ceil((xmax-xmin)/resolution)))
         h=min(max_texture_px,max(2,math.ceil((ymax-ymin)/resolution)))
         rgb=imagery.render((xmin,ymin,xmax,ymax),w,h)
-        vertices=[];uv=[]
-        cache={}
+        vertices=[];uv=[];cache={}
         for tri in triangles:
             coords=list(tri.exterior.coords)[:3]
             cross=(coords[1][0]-coords[0][0])*(coords[2][1]-coords[0][1])-(coords[1][1]-coords[0][1])*(coords[2][0]-coords[0][0])
             if cross<0:coords[1],coords[2]=coords[2],coords[1]
             for x,y in coords:
                 key=(round(x,6),round(y,6))
-                if key not in cache:
-                    nearby=sorted((_height_near(r,(x,y)) for r in g['members']),key=lambda t:t[0])
-                    # Blend only profiles with comparable local heights.
-                    best=nearby[0][1]
-                    matches=[(d,z) for d,z in nearby if abs(z-best)<=1.0 and d<=15]
-                    cache[key]=(sum(z/(d+0.5) for d,z in matches)/sum(1/(d+0.5) for d,z in matches)) if matches else best
+                if key not in cache:cache[key]=(g['height_solution']((x,y)) if 'height_solution' in g else _deck_height((x,y),g['members']))
                 vertices.append((x-bounds.left,y-bounds.bottom,cache[key]-base))
                 uv.append(((x-xmin)/(xmax-xmin),1-(y-ymin)/(ymax-ymin)))
         glb.add_tile(g['id'],vertices,uv,Image.fromarray(rgb));count+=1

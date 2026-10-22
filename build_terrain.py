@@ -13,6 +13,8 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from collections import defaultdict
 from rail_elevation_inference import infer_profiles, save_profiles, DEFAULTS
+from rail_topology_inference import infer_topology_profiles
+from group_elevation_solution import solve_group_elevations
 from crossing_deck_groups import group_crossings, save_groups, append_group_decks
 from pathlib import Path
 
@@ -1203,13 +1205,20 @@ def main():
     p.add_argument('--network', help='Network vector file: .gpkg, .json, .geojson, or .kml')
     p.add_argument('--infrastructure', help='Raw infrastructure_raw_osm.json from bridge-aware Overpass query')
     p.add_argument('--bridges', action='store_true', help='Estimate OSM-tagged bridge decks')
+    p.add_argument('--rail-inference-mode', choices=['legacy','topology'], default='topology')
+    p.add_argument('--rail-stable-approach', type=float, default=20.0)
+    p.add_argument('--rail-height-tolerance', type=float, default=1.5, help='Allowed vertical deviation from first approach projection (m)')
+    p.add_argument('--rail-grade-envelope-slack', type=float, default=0.03, help='Extra allowable height deviation per meter of path length')
+    p.add_argument('--rail-approach-grade-tolerance', type=float, default=0.01, help='Maximum difference between approach grades')
+    p.add_argument('--rail-max-turn', type=float, default=90.0)
+    p.add_argument('--deck-parallel-angle', type=float, default=15.0)
     p.add_argument('--infer-rail-crossings', action='store_true', help='Infer railway bridge spans from DEM grade anomalies and export shared Z profiles')
     p.add_argument('--mask-inferred-ground', action='store_true', help='Darken imagery under inferred rail bridge decks')
     p.add_argument('--rail-sample-spacing', type=float, default=5.0)
     p.add_argument('--rail-boundary-spacing', type=float, default=0.5, help='Horizontal sampling interval around suspected DEM drops (m)')
     p.add_argument('--rail-boundary-search', type=float, default=30.0, help='Distance to inspect around detected anomalies (m)')
     p.add_argument('--deck-group-gap', type=float, default=5.0, help='Merge compatible deck footprints separated by up to this distance (m)')
-    p.add_argument('--deck-group-z-tolerance', type=float, default=1.0, help='Maximum vertical separation for grouping crossing decks (m)')
+    p.add_argument('--deck-group-z-tolerance', type=float, default=float('inf'), help='Maximum vertical separation for grouping crossing decks (m)')
     p.add_argument('--rail-max-grade', type=float, default=0.03, help='Fraction: 0.03 = 3 percent')
     p.add_argument('--rail-min-span', type=float, default=10.0)
     p.add_argument('--rail-max-span', type=float, default=150.0)
@@ -1345,8 +1354,17 @@ def main():
                    'boundary_search_m':args.rail_boundary_search,
                    'boundary_spacing_m':args.rail_boundary_spacing}
             print('Inferring railway crossings from DEM profiles...',flush=True)
-            inferred = infer_profiles(vector_path,dem,cfg)
-            save_profiles(out,inferred)
+            if args.rail_inference_mode == 'topology':
+                cfg.update(sample_spacing_m=1.0,stable_m=args.rail_stable_approach,
+                           max_turn_deg=args.rail_max_turn,max_states=250000,
+                           height_tolerance_m=args.rail_height_tolerance,
+                           grade_envelope_slack=args.rail_grade_envelope_slack,
+                           approach_grade_tolerance=args.rail_approach_grade_tolerance,
+                           endpoint_clearance_m=0.25)
+                inferred = infer_topology_profiles(vector_path,dem,cfg)
+            else:
+                inferred = infer_profiles(vector_path,dem,cfg)
+            # Save only after group-level elevation reconciliation below.
             inferred_decks = [dict(c, type='railway') for c in inferred['crossings']
                               if LineString([(p[0],p[1]) for p in c['profile_xyz']]).intersects(corridor)]
             print(f'Inferred {len(inferred_decks)} railway spans; review inferred_crossings.csv',flush=True)
@@ -1378,7 +1396,21 @@ def main():
         if args.infer_rail_crossings:
             grouped_decks = group_crossings(inferred_decks, width=args.rail_bridge_width,
                                             gap=args.deck_group_gap,
-                                            vertical_tolerance=args.deck_group_z_tolerance)
+                                            vertical_tolerance=args.deck_group_z_tolerance,
+                                            parallel_angle=args.deck_parallel_angle)
+            if args.rail_inference_mode == 'topology':
+                diagnostics = solve_group_elevations(
+                    grouped_decks, inferred, dem,
+                    clearance=0.25, grade_limit=args.rail_max_grade)
+                corrected_by_id = {r['id']: r for g in grouped_decks
+                                   for r in g['members'] if 'group_id' in r}
+                for crossing in inferred['crossings']:
+                    replacement = corrected_by_id.get(crossing['id'])
+                    if replacement is not None:
+                        for field in ('profile_xyz', 'start_xyz', 'end_xyz', 'group_id'):
+                            crossing[field] = replacement[field]
+                print(f'Group elevation reconciliation: {diagnostics}', flush=True)
+            save_profiles(out, inferred)
             save_groups(out, grouped_decks, dem.crs)
             print(f'Grouped {len(inferred_decks)} inferred spans into {len(grouped_decks)} deck surfaces', flush=True)
         if bridge_records and grouped_decks:
