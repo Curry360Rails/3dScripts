@@ -21,6 +21,7 @@ OSM_JSON = HERE / 'osm_output' / 'railway_raw_osm.json'
 DEM_MOSAIC = DATA_DIR / '_raster_mosaics' / 'dem_mosaic.tif'
 DEM_FOLDER = HERE / '3dep_dem'
 TERRAIN_GEOREFERENCE = DATA_DIR / 'georeference.json'
+RAIL_PROFILES = DATA_DIR / 'railway_elevation_profiles.json'
 # Match the Z offset used when exporting network_lines.obj (normally 0.5 m).
 RAIL_Z_OFFSET_M = 0.5
 # Credentials are read from an environment variable; never hardcode tokens.
@@ -130,6 +131,21 @@ def load_osm_features():
     east, north = transform('EPSG:4326', crs, lon, lat)
     projected = dict(zip(ordered, zip(east, north)))
     heights = sample_dem(projected, crs)
+    if RAIL_PROFILES.is_file():
+        profile = json.loads(RAIL_PROFILES.read_text(encoding='utf-8'))
+        if profile.get('crs') != crs:
+            raise ValueError(f'Rail profile CRS {profile.get("crs")} != terrain CRS {crs}')
+        corrected_count = 0
+        for nid, record in profile.get('nodes', {}).items():
+            n = int(nid)
+            if n in projected:
+                if math.dist(projected[n], record['xy']) > 0.05:
+                    raise ValueError(f'Rail profile XY mismatch for OSM node {n}; regenerate profiles')
+                heights[n] = float(record['corrected_z_m'])
+                corrected_count += 1
+        print(f'Applied shared railway elevation profiles to {corrected_count} OSM nodes')
+    else:
+        print(f'WARNING: no corrected railway profile at {RAIL_PROFILES}; using DEM heights')
     features = []
     skipped = 0
     for way in ways:
@@ -366,14 +382,14 @@ def main():
             input(f"[{track_name}] Created. Press Enter to set its geometry... ")
         track.setX(x0);track.setY(y0);track.setZ(z0)
         rel=[v for x,y,z in pts for v in (x-x0,y-y0,z-z0)]
-        # setPointList() accepts flat XYZ values and preserves relative Z.
-        # createStraightPointsList() is not needed for this input.
+        # AnyLogic's helper duplicates each vertex three times but zeroes Z.
+        # Restore relative Z on all generated control points.
         prepared = list(Utils.createStraightPointsList(track, rel))
         if len(prepared) != 9 * len(pts):
-            raise ValueError(f"Unexpected point list length for {track_name}: {len(prepared)}")
-        for point_i, (_, _, z) in enumerate(pts):
-            for control_i in range(3):
-                prepared[point_i * 9 + control_i * 3 + 2] = z - z0
+            raise ValueError(f'Unexpected AnyLogic point structure for {track_name}: {len(prepared)}')
+        for k, (_, _, z) in enumerate(pts):
+            for j in range(3):
+                prepared[(3*k+j)*3+2] = z-z0
         print(f"SETTING POINTS {track_name} ({len(pts)} vertices)", flush=True)
         track.setPointList(prepared)
         print(f"POINTS SET {track_name}", flush=True)

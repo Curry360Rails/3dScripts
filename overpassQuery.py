@@ -5,10 +5,44 @@ GeoJSON and KML exports. No DEM heights are inferred here.
 """
 import argparse
 import json
+import random
+import time
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import requests
+
+RETRY_DELAYS = (5, 9, 21, 33)
+RETRY_JITTER_SECONDS = 0.75
+RETRY_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+
+def post_overpass(query, headers, url="https://overpass-api.de/api/interpreter"):
+    """Retry transient HTTP/network failures, but fail fast on malformed queries."""
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        try:
+            response = requests.post(
+                url, data={"data": query}, headers=headers, timeout=240
+            )
+            print(f"Overpass attempt {attempt + 1}: HTTP {response.status_code}", flush=True)
+            if response.ok:
+                return response
+            if response.status_code not in RETRY_STATUS_CODES:
+                print("Server response:", response.text[:3000])
+                response.raise_for_status()
+            failure = f"HTTP {response.status_code}: {response.text[:300]}"
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+        if attempt == len(RETRY_DELAYS):
+            raise RuntimeError(
+                f"Overpass failed after {attempt + 1} attempts. Last error: {failure}"
+            )
+        delay = max(0.0, RETRY_DELAYS[attempt] + random.uniform(
+            -RETRY_JITTER_SECONDS, RETRY_JITTER_SECONDS
+        ))
+        print(f"Transient Overpass error ({failure}); retrying in {delay:.1f}s", flush=True)
+        time.sleep(delay)
+    raise AssertionError("Unreachable")
 
 
 def load_polygon(path):
@@ -137,12 +171,7 @@ out skel qt;
         'Accept': 'application/json',
         'Accept-Encoding': 'gzip, deflate',
     }
-    response = requests.post('https://overpass-api.de/api/interpreter',
-                             data={'data': query}, headers=headers, timeout=240)
-    print('HTTP status:', response.status_code)
-    if not response.ok:
-        print('Server response:', response.text[:3000])
-        response.raise_for_status()
+    response = post_overpass(query, headers)
     data = response.json()
     if not isinstance(data.get('elements'), list):
         raise ValueError('Overpass response is missing elements')

@@ -12,6 +12,7 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 from collections import defaultdict
+from rail_elevation_inference import infer_profiles, save_profiles, DEFAULTS
 from pathlib import Path
 
 from tqdm.auto import tqdm
@@ -348,10 +349,24 @@ def _line_parts(geom):
         return [line for part in geom.geoms for line in _line_parts(part)]
     return []
 
-def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offset, preserve_z, exact_vertices=False):
+def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offset, preserve_z, exact_vertices=False, rail_profile=None):
     path = out / 'network_lines.obj'
     idx = 1
     count = 0
+    # Project sampled vertices onto inferred spans to keep network_lines.obj in
+    # agreement with corrected AnyLogic track Z (for rail-only OSM input).
+    segments = []
+    if rail_profile:
+        from shapely.strtree import STRtree
+        for crossing in rail_profile.get('crossings', []):
+            points = crossing['profile_xyz']
+            for a,b in zip(points,points[1:]):
+                line = LineString([(a[0],a[1]),(b[0],b[1])])
+                if line.length > 1e-6:
+                    segments.append((line,a[2],b[2]))
+        segment_tree = STRtree([x[0] for x in segments]) if segments else None
+    else:
+        segment_tree = None
     with path.open('w', encoding='utf-8') as obj:
         obj.write('# Polyline edges only (not rendered surfaces)\n')
         obj.write('o Transport_Lines\n')
@@ -374,6 +389,15 @@ def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offs
             chain = []
             for j,p in enumerate(pts):
                 z = p[2] if has_z else next(samples)[0]
+                if segment_tree is not None and not has_z:
+                    from shapely.geometry import Point
+                    point = Point(p[0],p[1])
+                    for si in segment_tree.query(point.buffer(0.25)):
+                        line,z_a,z_b = segments[int(si)]
+                        if line.distance(point) <= 0.05:
+                            frac = line.project(point)/line.length
+                            z = z_a + (z_b-z_a)*frac
+                            break
                 if np.ma.is_masked(z) or not np.isfinite(z) or (not has_z and dem.nodata is not None and z == dem.nodata):
                     if len(chain)>1: obj.write('l '+' '.join(map(str,chain))+'\n')
                     chain=[]
@@ -771,7 +795,7 @@ def append_bridge_decks(glb, records, imagery, bounds, base, resolution,
         w=min(max_texture_px,max(2,math.ceil((xmax-xmin)/resolution)))
         h=min(max_texture_px,max(2,math.ceil((ymax-ymin)/resolution)))
         rgb=imagery.render(extent,w,h)
-        glb.add_tile(f"Bridge_{r['type']}_{r['osm_way_id']}",verts,uv,Image.fromarray(rgb))
+        glb.add_tile(f"Bridge_{r['type']}_{r.get('osm_way_id', r.get('id', 'inferred'))}",verts,uv,Image.fromarray(rgb))
         added+=1
     return added
 
@@ -861,7 +885,8 @@ class StreamingGLB:
 def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, valid,
                           faces, step, base, corridor, resolution, tile_pixels,
                           workers=1, clip_batch_size=4000, texture_scale=1.0, output_format="obj",
-                          bridges=None, rail_bridge_width=6.0, road_bridge_width=12.0):
+                          bridges=None, rail_bridge_width=6.0, road_bridge_width=12.0,
+                          inferred_bridges=None, mask_inferred_ground=False):
     """Clip faces in batches; avoid intersections for interior faces; parallel on request."""
     from shapely import to_wkb
     b=bounds
@@ -893,6 +918,17 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
     material_lines=[]
     vertex_index=0
     glb = StreamingGLB(out/'terrain.glb') if is_glb else None
+    # Spatially index inferred spans for masking duplicate aerial road/rail imagery.
+    mask_shapes = []
+    if mask_inferred_ground and inferred_bridges:
+        from shapely.strtree import STRtree
+        for crossing in inferred_bridges:
+            coords = [(p[0],p[1]) for p in crossing['profile_xyz']]
+            if len(coords) >= 2:
+                mask_shapes.append(LineString(coords).buffer(rail_bridge_width/2))
+        mask_tree = STRtree(mask_shapes) if mask_shapes else None
+    else:
+        mask_tree = None
     obj = None
     try:
         if not is_glb:
@@ -905,6 +941,15 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
                 w=max(2,math.ceil((tx1-tx0)/resolution*texture_scale))
                 h=max(2,math.ceil((ty1-ty0)/resolution*texture_scale))
                 rgb=imagery.render((tx0,ty0,tx1,ty1),w,h)
+                if mask_tree is not None:
+                    from rasterio.features import rasterize
+                    tile_box = box(tx0,ty0,tx1,ty1)
+                    nearby = mask_tree.query(tile_box)
+                    shapes = [(mask_shapes[int(k)], 1) for k in nearby if mask_shapes[int(k)].intersects(tile_box)]
+                    if shapes:
+                        mask = rasterize(shapes, out_shape=(h,w),
+                                         transform=from_bounds(tx0,ty0,tx1,ty1,w,h), fill=0)
+                        rgb[mask.astype(bool)] = (35,35,35)
                 texname=f'corridor_{ix}_{iy}.png'
                 mat=f'Corridor_{ix}_{iy}'
                 if not is_glb:
@@ -948,8 +993,8 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
                         vertex_index+=3
                 if is_glb:
                     glb.add_tile(mat, tile_vertices, tile_uv, Image.fromarray(rgb))
-            if is_glb and bridges:
-                n=append_bridge_decks(glb,bridges,imagery,b,base,
+            if is_glb and (bridges or inferred_bridges):
+                n=append_bridge_decks(glb,(bridges or [])+(inferred_bridges or []),imagery,b,base,
                        resolution/texture_scale,rail_bridge_width,road_bridge_width)
                 print(f'Added {n} estimated bridge decks to GLB',flush=True)
         if is_glb:
@@ -1012,7 +1057,16 @@ def main():
     p.add_argument('--gpkg', help='GPKG, raw Overpass OSM JSON, GeoJSON, or KML input (legacy flag)')
     p.add_argument('--network', help='Network vector file: .gpkg, .json, .geojson, or .kml')
     p.add_argument('--infrastructure', help='Raw infrastructure_raw_osm.json from bridge-aware Overpass query')
-    p.add_argument('--bridges', action='store_true', help='Estimate bridge elevations and add separate textured decks to GLB')
+    p.add_argument('--bridges', action='store_true', help='Estimate OSM-tagged bridge decks')
+    p.add_argument('--infer-rail-crossings', action='store_true', help='Infer railway bridge spans from DEM grade anomalies and export shared Z profiles')
+    p.add_argument('--mask-inferred-ground', action='store_true', help='Darken imagery under inferred rail bridge decks')
+    p.add_argument('--rail-sample-spacing', type=float, default=5.0)
+    p.add_argument('--rail-max-grade', type=float, default=0.03, help='Fraction: 0.03 = 3 percent')
+    p.add_argument('--rail-min-span', type=float, default=10.0)
+    p.add_argument('--rail-max-span', type=float, default=150.0)
+    p.add_argument('--rail-min-dem-drop', type=float, default=1.5)
+    p.add_argument('--rail-sag-change-per-100ft', type=float, default=0.05)
+    p.add_argument('--rail-crest-change-per-100ft', type=float, default=0.10)
     p.add_argument('--bridge-approach-m', type=float, default=12.0)
     p.add_argument('--rail-bridge-width', type=float, default=6.0)
     p.add_argument('--road-bridge-width', type=float, default=12.0)
@@ -1046,9 +1100,9 @@ def main():
     vector_path = args.network or args.gpkg
     if not vector_path:
         p.error('Provide --network or --gpkg')
-    if args.bridges and (not args.corridor_only or args.format != 'glb'):
+    if (args.bridges or args.infer_rail_crossings) and (not args.corridor_only or args.format != 'glb'):
         p.error('--bridges currently requires --corridor-only --format glb')
-    if min(args.bridge_approach_m,args.rail_bridge_width,args.road_bridge_width)<=0:
+    if min(args.bridge_approach_m,args.rail_bridge_width,args.road_bridge_width,args.rail_sample_spacing,args.rail_min_span,args.rail_max_span)<=0 or args.rail_min_span >= args.rail_max_span or args.rail_min_dem_drop <= 0 or args.rail_max_grade <= 0:
         p.error('Bridge approach distance and widths must be positive')
     if not args.network_only and not args.imagery:
         p.error('--imagery is required unless --network-only is specified')
@@ -1125,6 +1179,22 @@ def main():
                 if not polys: raise ValueError('No polygonal corridor inside DEM')
                 corridor = max(polys, key=lambda g: g.area)
             print(f'Corridor area: {corridor.area / 1e6:.3f} km2', flush=True)
+        inferred = None
+        inferred_decks = []
+        if args.infer_rail_crossings:
+            cfg = {'sample_spacing_m':args.rail_sample_spacing,
+                   'grade_limit':args.rail_max_grade,
+                   'min_span_m':args.rail_min_span,
+                   'max_span_m':args.rail_max_span,
+                   'min_depth_m':args.rail_min_dem_drop,
+                   'sag_change_pct_per_100ft':args.rail_sag_change_per_100ft,
+                   'crest_change_pct_per_100ft':args.rail_crest_change_per_100ft}
+            print('Inferring railway crossings from DEM profiles...',flush=True)
+            inferred = infer_profiles(vector_path,dem,cfg)
+            save_profiles(out,inferred)
+            inferred_decks = [dict(c, type='railway') for c in inferred['crossings']
+                              if LineString([(p[0],p[1]) for p in c['profile_xyz']]).intersects(corridor)]
+            print(f'Inferred {len(inferred_decks)} railway spans; review inferred_crossings.csv',flush=True)
         cells,step = build_cells((b.left,b.bottom,b.right,b.top),tree,args.near_spacing,
                                  args.transition_spacing,args.background_spacing,
                                  args.fine_buffer,args.transition_buffer,args.max_cells,
@@ -1147,12 +1217,25 @@ def main():
             bridge_records=bridge_profiles(infrastructure,dem,corridor,args.bridge_approach_m,
                                            args.bridge_review_clearance)
             save_bridge_profiles(out,bridge_records,dem.crs)
+            if inferred_decks:
+                tagged_lines = [LineString([(p[0],p[1]) for p in r['profile_xyz']])
+                                for r in bridge_records if r['type']=='railway' and len(r['profile_xyz'])>=2]
+                if tagged_lines:
+                    kept=[]
+                    for candidate in inferred_decks:
+                        line=LineString([(p[0],p[1]) for p in candidate['profile_xyz']])
+                        overlap=sum(line.intersection(t.buffer(1.0)).length for t in tagged_lines)
+                        if overlap < 0.3*line.length:
+                            kept.append(candidate)
+                    print(f'Removed {len(inferred_decks)-len(kept)} inferred spans overlapping tagged railway bridges')
+                    inferred_decks=kept
             print(f'Bridge candidates: {len(bridge_records)}; review bridge_review.csv',flush=True)
         if args.corridor_only:
             stats = export_corridor_tiled(out, dem, imagery_sources, b, keys, elevations, valid, faces,
                                           step, base, corridor, args.texture_resolution,
                                           args.texture_tile_size, args.workers, args.clip_batch_size, args.texture_scale, args.format,
-                                          bridge_records, args.rail_bridge_width, args.road_bridge_width)
+                                          bridge_records, args.rail_bridge_width, args.road_bridge_width,
+                                          inferred_decks, args.mask_inferred_ground)
             tw = th = 0
         else:
             if args.format == "glb":
@@ -1178,7 +1261,7 @@ def main():
                     if valid[a-1] and valid[c-1] and valid[d-1]:
                         f.write(f'f {a}/{a} {c}/{c} {d}/{d}\n')
             (out/'terrain.mtl').write_text('newmtl TerrainMaterial\nKd 1 1 1\nmap_Kd terrain_texture.png\n')
-        export_lines(lines,dem,out,b.left,b.bottom,base,args.line_spacing,args.line_z_offset,not args.use_dem_line_z)
+        export_lines(lines,dem,out,b.left,b.bottom,base,args.line_spacing,args.line_z_offset,not args.use_dem_line_z,rail_profile=inferred)
         (out/'georeference.json').write_text(json.dumps({
             'crs':str(dem.crs),'origin_x':b.left,'origin_y':b.bottom,
             'base_elevation':base,'layers':layers,'near_spacing':args.near_spacing,
@@ -1196,7 +1279,8 @@ def main():
             'texture_scale':args.texture_scale, 'terrain_format':args.format,
             'dem_sources':dem_sources, 'imagery_sources':imagery_sources,
             'imagery_mode':'on_demand_warped_vrt',
-            'bridge_aware':args.bridges, 'bridge_profiles':'bridge_profiles.json' if args.bridges else None
+            'bridge_aware':args.bridges, 'bridge_profiles':'bridge_profiles.json' if args.bridges else None,
+            'railway_elevation_profiles':'railway_elevation_profiles.json' if args.infer_rail_crossings else None
         },indent=2))
         print(f'Done: {out.resolve()} | source mesh {len(vertices):,} vertices, {len(faces):,} triangles' + (' | corridor tiles: '+str(stats['tiles']) if args.corridor_only else f' | texture {tw}x{th}'))
 

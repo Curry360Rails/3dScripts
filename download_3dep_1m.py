@@ -11,6 +11,10 @@ import re
 import sys
 import time
 import zipfile
+import os
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
@@ -122,38 +126,84 @@ def safe_name(url, item, index):
     return name
 
 
-def download(s, item, out, index, overwrite=False):
+def download_one(job, out, overwrite=False, extract=False):
+    """One independent HTTP session per worker; atomically publish completed files."""
+    index, item = job
     url = item['downloadURL']
     dest = out / safe_name(url, item, index)
-    if dest.exists() and dest.stat().st_size > 0 and not overwrite:
-        print(f'Skipping existing: {dest.name}')
-        return dest
+    is_zip = dest.suffix.lower() == '.zip'
+    extracted = out / dest.stem
+    # Previously extracted archives may already have been removed.
+    if is_zip and extract and extracted.is_dir() and any(extracted.rglob('*')) and not overwrite:
+        return ('skipped', str(extracted))
+    if dest.is_file() and dest.stat().st_size > 0 and not overwrite and not (extract and is_zip):
+        return ('skipped', str(dest))
     part = dest.with_name(dest.name + '.part')
-    print(f'Downloading {index}: {dest.name}')
-    with s.get(url, stream=True, timeout=(30, 180)) as r:
-        r.raise_for_status()
-        with part.open('wb') as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-    part.replace(dest)
-    return dest
+    try:
+        if not dest.is_file() or overwrite:
+            part.unlink(missing_ok=True)
+            with session_with_retries() as session:
+                with session.get(url, stream=True, timeout=(30, 180)) as response:
+                    response.raise_for_status()
+                    expected = response.headers.get('Content-Length')
+                    with part.open('wb') as file:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                file.write(chunk)
+                    if expected and part.stat().st_size != int(expected):
+                        raise IOError(f'Incomplete download: {dest.name}')
+            part.replace(dest)
+        if extract and is_zip:
+            # Extract to a temporary directory and publish only when successful.
+            temp_dir = out / (dest.stem + '.extracting')
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+            temp_dir.mkdir(parents=True)
+            try:
+                with zipfile.ZipFile(dest) as archive:
+                    if archive.testzip() is not None:
+                        raise ValueError(f'Corrupt ZIP: {dest.name}')
+                    base = temp_dir.resolve()
+                    for member in archive.infolist():
+                        target = (temp_dir / member.filename).resolve()
+                        if not target.is_relative_to(base):
+                            raise ValueError(f'Unsafe ZIP member: {member.filename}')
+                        if ((member.external_attr >> 16) & 0o170000) == 0o120000:
+                            raise ValueError(f'Symlink in ZIP: {member.filename}')
+                    archive.extractall(temp_dir)
+                if extracted.exists():
+                    if not overwrite:
+                        raise FileExistsError(f'Existing extraction directory: {extracted}')
+                    shutil.rmtree(extracted)
+                temp_dir.rename(extracted)
+            finally:
+                if temp_dir.exists():
+                    shutil.rmtree(temp_dir)
+            return ('extracted', str(extracted))
+        return ('downloaded', str(dest))
+    finally:
+        part.unlink(missing_ok=True)
 
 
-def extract_zip(path, out):
-    if not zipfile.is_zipfile(path):
-        return
-    dest = out / path.stem
-    dest.mkdir(exist_ok=True)
-    with zipfile.ZipFile(path) as z:
-        # Avoid unsafe paths in archives.
-        for info in z.infolist():
-            target = (dest / info.filename).resolve()
-            if not target.is_relative_to(dest.resolve()):
-                raise ValueError(f'Unsafe ZIP path: {info.filename}')
-        z.extractall(dest)
-    tifs = list(dest.rglob('*.tif')) + list(dest.rglob('*.tiff'))
-    print(f'Extracted {path.name}: {len(tifs)} TIFF files (other product files may also be present)')
+def download_all(products, out, workers=0, overwrite=False, extract=False):
+    """workers=0 means one worker per matching product (all concurrently)."""
+    jobs = list(enumerate(products, 1))
+    if not jobs:
+        return 0
+    concurrency = len(jobs) if workers == 0 else min(workers, len(jobs))
+    print(f'Downloading {len(jobs)} 3DEP products using {concurrency} concurrent workers', flush=True)
+    failed = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {executor.submit(download_one, job, out, overwrite, extract): job for job in jobs}
+        for future in as_completed(futures):
+            index, item = futures[future]
+            try:
+                status, path = future.result()
+                print(f'[{index}/{len(jobs)}] {status.upper()}: {path}', flush=True)
+            except Exception as exc:
+                failed += 1
+                print(f'[{index}/{len(jobs)}] FAILED: {item.get("downloadURL")}: {exc}', file=sys.stderr, flush=True)
+    return failed
 
 
 def main():
@@ -173,7 +223,10 @@ def main():
     p.add_argument('--download', action='store_true', help='Download products (default: search and save manifest only)')
     p.add_argument('--extract', action='store_true', help='Extract downloaded ZIP archives')
     p.add_argument('--overwrite', action='store_true')
+    p.add_argument('--workers', type=int, default=0, help='Concurrent downloads: 0 (default) downloads all matching products simultaneously; specify e.g. 8 to limit concurrency')
     args = p.parse_args()
+    if args.workers < 0:
+        p.error('--workers must be 0 (all) or a positive integer')
     if args.page_size < 1 or args.max_results < 1:
         p.error('page-size and max-results must be positive')
     if args.start_date and not args.end_date:
@@ -202,13 +255,9 @@ def main():
         if not args.download:
             print('Search-only mode. Add --download to fetch products.')
             return
-        for i, item in enumerate(products, 1):
-            try:
-                path = download(session, item, out, i, args.overwrite)
-                if args.extract:
-                    extract_zip(path, out)
-            except (requests.RequestException, OSError, zipfile.BadZipFile) as exc:
-                print(f'WARNING: failed product {i}: {exc}', file=sys.stderr)
+        failures = download_all(products, out, args.workers, args.overwrite, args.extract)
+        if failures:
+            raise RuntimeError(f'{failures} of {len(products)} 3DEP downloads failed')
         print('Finished. Original products are not cropped or mosaicked.')
     except (ValueError, requests.RequestException, RuntimeError) as exc:
         p.exit(1, f'ERROR: {exc}\n')
