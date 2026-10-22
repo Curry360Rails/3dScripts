@@ -123,7 +123,51 @@ def _detect_spans(s, z, cfg):
         if any(not (j <= a or i >= b) for a,b,_ in chosen):
             continue
         chosen.append((i,j,depth))
-    return sorted(chosen)
+    # Refine both limits on the original sampled lattice (5 m by default).
+    # Expand toward the first sustained departure from the plausible chord,
+    # not merely the largest grade spike. This is deliberately local.
+    refined = []
+    pad_steps = max(1, round(cfg.get('boundary_search_m', 30.0) / spacing))
+    departure = cfg.get('boundary_deviation_m', 0.5)
+    for i, j, depth in sorted(chosen):
+        left = max(0, i-pad_steps)
+        right = min(len(s)-1, j+pad_steps)
+        if not np.isfinite(z[left:right+1]).all():
+            refined.append((i,j,depth)); continue
+        # The bridge chord uses stable elevations at the candidate's ends.
+        chord = z[i] + (z[j]-z[i]) * (s[left:right+1]-s[i]) / max(1e-6,s[j]-s[i])
+        residual = chord-z[left:right+1]
+        bad = residual >= departure
+        # Look for the earliest sustained discrepancy adjacent to the detected span.
+        a, b = i, j
+        for k in range(i-1, left-1, -1):
+            if bad[k-left] and (k+1 >= len(s) or bad[k+1-left]):
+                a = k
+            elif k < a-1:
+                break
+        for k in range(j+1, right+1):
+            if bad[k-left] and bad[k-1-left]:
+                b = k
+            elif k > b+1:
+                break
+        # Preserve stable end anchors outside the anomaly, within available range.
+        a = max(left, a-1)
+        b = min(right, b+1)
+        if s[b]-s[a] <= max_len and s[b]-s[a] >= min_len:
+            refined.append((a,b,max(depth,float(np.max(np.interp(s[a:b+1],
+                [s[a],s[b]],[z[a],z[b]])-z[a:b+1])))))
+        else:
+            refined.append((i,j,depth))
+    # Merge newly overlapping intervals on the same railway chain.
+    merged = []
+    for a,b,depth in sorted(refined):
+        if merged and a <= merged[-1][1]:
+            old_a,old_b,old_depth = merged[-1]
+            if s[max(b,old_b)]-s[old_a] <= max_len:
+                merged[-1] = (old_a,max(b,old_b),max(depth,old_depth))
+                continue
+        merged.append((a,b,depth))
+    return merged
 
 
 def infer_profiles(osm_path, dem, cfg=None):
@@ -167,20 +211,105 @@ def infer_profiles(osm_path, dem, cfg=None):
                 continue
             spans.extend((run[i],run[j],depth) for i,j,depth in
                          _detect_spans(ss[run], zz[run], cfg))
+        # Refine only detected coarse intervals at 0.5 m (configurable).
+        # Detect the first/last sustained departure, not a late grade spike.
+        fine_spacing = float(cfg.get('boundary_spacing_m', 0.5))
+        search_m = float(cfg.get('boundary_search_m', 30.0))
+        departure = float(cfg.get('boundary_deviation_m', 0.5))
+        if fine_spacing <= 0:
+            raise ValueError('boundary_spacing_m must be positive')
+        refined = []
+        for i, j, depth in spans:
+            left = max(0.0, float(ss[i]) - search_m)
+            right = min(float(ss[-1]), float(ss[j]) + search_m)
+            fs = np.arange(left, right, fine_spacing, dtype=float)
+            fs = np.unique(np.r_[fs, right, ss[i], ss[j]])
+            fx = np.interp(fs, unique_s, unique_xy[:, 0])
+            fy = np.interp(fs, unique_s, unique_xy[:, 1])
+            fz = _sample(dem, list(zip(fx, fy)))
+            if not np.isfinite(fz).all():
+                continue
+            # Use the coarse anchors only to find the anomalous interior.
+            # np.interp clamps outside the anchor interval; extrapolate instead.
+            slope = (zz[j] - zz[i]) / max(1e-9, ss[j] - ss[i])
+            expected = zz[i] + slope * (fs - ss[i])
+            residual = expected - fz
+            bad = residual >= departure
+            sustain = max(2, int(math.ceil(2.0 / fine_spacing)))
+            # Require a sustained run; isolated LiDAR/DEM noise is ignored.
+            runs = []
+            start = None
+            for k, flag in enumerate(bad):
+                if flag and start is None:
+                    start = k
+                if start is not None and (not flag or k == len(bad)-1):
+                    stop = k if flag and k == len(bad)-1 else k-1
+                    if stop-start+1 >= sustain:
+                        runs.append((start, stop))
+                    start = None
+            # Retain only anomalous runs intersecting the coarse candidate.
+            core = [(a,b) for a,b in runs if fs[b] >= ss[i] and fs[a] <= ss[j]]
+            if not core:
+                continue
+            first, last = min(a for a,_ in core), max(b for _,b in core)
+            # Include nearby runs belonging to the same depression, but not
+            # unrelated anomalies farther away in the search window.
+            for a,b in runs:
+                if b < first and fs[first]-fs[b] <= 2.0:
+                    first = a
+                elif a > last and fs[a]-fs[last] <= 2.0:
+                    last = b
+            # Anchor just outside the first departure and final recovery.
+            ia = max(0, first-1)
+            ib = min(len(fs)-1, last+1)
+            start_s, end_s = float(fs[ia]), float(fs[ib])
+            if not cfg['min_span_m'] <= end_s-start_s <= cfg['max_span_m']:
+                continue
+            refined.append((start_s, end_s, depth))
+
+        # Merge overlapping / nearly adjacent refined intervals on the SAME
+        # continuous railway chain before creating deck geometry.
+        merged = []
+        for start_s, end_s, depth in sorted(refined):
+            if merged and start_s <= merged[-1][1] + 2.0 and end_s-merged[-1][0] <= cfg['max_span_m']:
+                a,b,d = merged[-1]
+                merged[-1] = (a,max(b,end_s),max(d,depth))
+            else:
+                merged.append((start_s,end_s,depth))
         fixed = zz.copy()
-        for i,j,depth in spans:
-            fixed[i:j+1] = np.interp(ss[i:j+1], [ss[i],ss[j]], [zz[i],zz[j]])
-            crossings.append({'id': f'inferred_{chains_count}_{len(crossings)+1}',
-                'way_ids': members, 'start_s_m':float(ss[i]),'end_s_m':float(ss[j]),
-                'length_m':float(ss[j]-ss[i]),'max_dem_drop_m':float(depth),
-                'start_xyz':[float(xx[i]),float(yy[i]),float(fixed[i])],
-                'end_xyz':[float(xx[j]),float(yy[j]),float(fixed[j])],
-                'profile_xyz':[[float(xx[k]),float(yy[k]),float(fixed[k])] for k in range(i,j+1)],
-                'type':'railway','status':'inferred_review_required',
+        corrections = []
+        for start_s, end_s, depth in merged:
+            # Re-sample the *actual* fine-grid endpoints; don't round them
+            # back to the coarse 5 m lattice.
+            endpoint_xy = [(float(np.interp(t,unique_s,unique_xy[:,0])),
+                            float(np.interp(t,unique_s,unique_xy[:,1])))
+                           for t in (start_s,end_s)]
+            endpoint_z = _sample(dem, endpoint_xy)
+            if not np.isfinite(endpoint_z).all():
+                continue
+            corrections.append((start_s, end_s, endpoint_z.copy()))
+            inside = (ss >= start_s) & (ss <= end_s)
+            fixed[inside] = np.interp(ss[inside], [start_s,end_s], endpoint_z)
+            fine_s = np.arange(start_s,end_s,fine_spacing,dtype=float)
+            fine_s = np.unique(np.r_[fine_s,end_s])
+            profile = [[float(np.interp(t,unique_s,unique_xy[:,0])),
+                        float(np.interp(t,unique_s,unique_xy[:,1])),
+                        float(np.interp(t,[start_s,end_s],endpoint_z))]
+                       for t in fine_s]
+            crossings.append({'id':f'inferred_{chains_count}_{len(crossings)+1}',
+                'way_ids':members,'start_s_m':start_s,'end_s_m':end_s,
+                'length_m':end_s-start_s,'max_dem_drop_m':float(depth),
+                'start_xyz':profile[0],'end_xyz':profile[-1],
+                'profile_xyz':profile,'type':'railway',
+                'status':'inferred_review_required',
                 'source':'DEM anomaly; not a surveyed bridge'})
         for nid, s in zip(ids, distances):
             # Keep original OSM node positions and sample interpolated corrected Z.
             z = float(np.interp(s, ss[valid], fixed[valid]))
+            for start_s, end_s, endpoint_z in corrections:
+                if start_s <= s <= end_s:
+                    z = float(np.interp(s, [start_s, end_s], endpoint_z))
+                    break
             if math.isfinite(z):
                 corrected[nid].append(z)
     nodes_out = {}
@@ -213,4 +342,5 @@ DEFAULTS = {
     'sample_spacing_m':5.0, 'grade_limit':0.03,
     'sag_change_pct_per_100ft':0.05, 'crest_change_pct_per_100ft':0.10,
     'min_span_m':10.0, 'max_span_m':150.0, 'min_depth_m':1.5,
+    'boundary_search_m':30.0, 'boundary_spacing_m':0.5, 'boundary_deviation_m':0.5,
 }

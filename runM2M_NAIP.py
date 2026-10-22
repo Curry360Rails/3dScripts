@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import requests
+from pipeline_cache import cached_json, get as cache_get, put as cache_put, is_valid_file
 
 API = 'https://m2m.cr.usgs.gov/api/api/json/stable/'
 ID_PATTERN = re.compile(r'^(.*)_(\d{8})$')
@@ -82,7 +83,7 @@ def search_all(session, dataset, spatial_filter, start, end, page_size):
                 'acquisitionFilter': {'start': start, 'end': end},
             },
         }
-        data = call(session, 'scene-search', payload) or {}
+        data = cached_json('naip-scene-page', {'endpoint':'scene-search','payload':payload}, lambda: call(session, 'scene-search', payload) or {}, ttl=int(os.environ.get('RAIL_NAIP_SEARCH_TTL_DAYS','7'))*86400)
         page = data.get('results') or []
         for scene in page:
             entity = scene.get('entityId')
@@ -104,7 +105,8 @@ def search_all(session, dataset, spatial_filter, start, end, page_size):
 def download_options(session, dataset, ids, batch_size=500):
     result = {}
     for i in range(0, len(ids), batch_size):
-        options = call(session, 'download-options', {'datasetName': dataset, 'entityIds': ids[i:i+batch_size]}) or []
+        request = {'datasetName': dataset, 'entityIds': ids[i:i+batch_size]}
+        options = cached_json('naip-download-options', request, lambda: call(session, 'download-options', request) or [], ttl=int(os.environ.get('RAIL_NAIP_SEARCH_TTL_DAYS','7'))*86400)
         for option in options:
             entity = option.get('entityId')
             if entity:
@@ -215,16 +217,23 @@ def extract_and_remove_zip(archive):
 
 def download_one(job, output, overwrite, extract_zips=True):
     number, url = job
+    cache_params = {'url': url, 'extract_zips': extract_zips}
+    if not overwrite:
+        hit = cache_get('naip-product', cache_params)
+        if hit:
+            return ('skipped', str(hit['outputs'][0]))
     for attempt in range(3):
         try:
             with requests.get(url, stream=True, timeout=(25, 180)) as response:
                 response.raise_for_status()
                 name = filename_from_response(response, url, number)
                 dest = output / name
-                if dest.exists() and dest.stat().st_size > 0 and not overwrite:
+                if dest.exists() and is_valid_file(dest) and not overwrite:
                     if extract_zips and dest.suffix.lower() == '.zip':
                         extracted = extract_and_remove_zip(dest)
+                        cache_put('naip-product', cache_params, sorted(p for p in extracted.rglob('*') if p.is_file()))
                         return ('extracted', str(extracted))
+                    cache_put('naip-product', cache_params, [dest])
                     return ('skipped', str(dest))
                 temp = output / (name + '.part')
                 with temp.open('wb') as file:
@@ -237,7 +246,9 @@ def download_one(job, output, overwrite, extract_zips=True):
                 temp.replace(dest)
                 if extract_zips and dest.suffix.lower() == '.zip':
                     extracted = extract_and_remove_zip(dest)
+                    cache_put('naip-product', cache_params, sorted(p for p in extracted.rglob('*') if p.is_file()))
                     return ('extracted', str(extracted))
+                cache_put('naip-product', cache_params, [dest])
                 return ('downloaded', str(dest))
         except (requests.RequestException, OSError, ValueError, zipfile.BadZipFile) as exc:
             if attempt == 2:
@@ -287,6 +298,13 @@ def main():
             return
         options = download_options(session, args.dataset, [s['entityId'] for s in scenes])
         selected, unavailable = choose_scenes(scenes, options)
+        selection_params = {'dataset': args.dataset, 'bbox': args.bbox,
+                            'selected': sorted((scene['entityId'], str(option['id'])) for scene, option in selected),
+                            'extract_zips': not args.keep_zips}
+        selection_hit = None if args.overwrite else cache_get('naip-selection', selection_params)
+        if selection_hit and not args.list_only:
+            print(f'CACHE HIT: {len(selected)} selected NAIP scenes already downloaded and verified; no download requests needed', flush=True)
+            return
         with (args.output/'selected_scenes.csv').open('w',newline='',encoding='utf-8') as file:
             writer = csv.writer(file)
             writer.writerow(['tile','entityId','acquisitionDate','productId'])
@@ -309,8 +327,16 @@ def main():
                 counts[status] += 1
                 print(f'{status.upper()}: {detail}',flush=True)
         print('Summary:', counts)
+        if counts['failed'] == 0 and len(urls) >= len(selected):
+            final_files = sorted(p for p in args.output.rglob('*') if p.is_file() and
+                                 p.suffix.lower() in ('.tif', '.tiff', '.jp2', '.zip'))
+            if final_files:
+                cache_put('naip-selection', selection_params, final_files)
+
         if len(urls) < len(selected):
-            print('WARNING: Fewer download URLs than selected tiles. Some products may still be preparing or failed.')
+            raise RuntimeError(f'Incomplete NAIP download preparation: {len(urls)} URLs for {len(selected)} scenes')
+        if counts['failed']:
+            raise RuntimeError(f"{counts['failed']} NAIP downloads failed")
     finally:
         if api_key:
             try:

@@ -11,6 +11,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import requests
+from pipeline_cache import cached_json
 
 RETRY_DELAYS = (5, 9, 21, 33)
 RETRY_JITTER_SECONDS = 0.75
@@ -171,8 +172,7 @@ out skel qt;
         'Accept': 'application/json',
         'Accept-Encoding': 'gzip, deflate',
     }
-    response = post_overpass(query, headers)
-    data = response.json()
+    data = cached_json('overpass-query', {'endpoint':'https://overpass-api.de/api/interpreter', 'query':query}, lambda: post_overpass(query, headers).json(), ttl=int(__import__('os').environ.get('RAIL_OSM_TTL_DAYS','7')) * 86400)
     if not isinstance(data.get('elements'), list):
         raise ValueError('Overpass response is missing elements')
     export_data(data, args.output)

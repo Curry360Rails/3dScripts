@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.parse import urlparse, unquote
 
 import requests
+from pipeline_cache import cached_json, get as cache_get, put as cache_put, is_valid_file
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -95,10 +96,13 @@ def get_products(s, pts, args):
     offset = 0
     while True:
         params = dict(base, offset=offset)
-        r = s.get(API, params=params, timeout=(20, 120))
-        if not r.ok:
-            raise RuntimeError(f'TNM API HTTP {r.status_code}: {r.text[:700]}\nURL: {r.url}')
-        payload = r.json()
+        def fetch_page():
+            r = s.get(API, params=params, timeout=(20, 120))
+            if not r.ok:
+                raise RuntimeError(f'TNM API HTTP {r.status_code}: {r.text[:700]}\nURL: {r.url}')
+            return r.json()
+        payload = cached_json('tnm-products-page', {'url': API, 'params': params}, fetch_page,
+                              ttl=int(__import__('os').environ.get('RAIL_DEM_SEARCH_TTL_DAYS','30')) * 86400)
         if payload.get('errors'):
             raise RuntimeError(f'TNM API errors: {payload["errors"]}')
         items = payload.get('items', [])
@@ -127,20 +131,22 @@ def safe_name(url, item, index):
 
 
 def download_one(job, out, overwrite=False, extract=False):
-    """One independent HTTP session per worker; atomically publish completed files."""
+    """Per-product cache and atomic download/extraction; no false cache hits on partial files."""
     index, item = job
     url = item['downloadURL']
     dest = out / safe_name(url, item, index)
     is_zip = dest.suffix.lower() == '.zip'
     extracted = out / dest.stem
-    # Previously extracted archives may already have been removed.
-    if is_zip and extract and extracted.is_dir() and any(extracted.rglob('*')) and not overwrite:
-        return ('skipped', str(extracted))
-    if dest.is_file() and dest.stat().st_size > 0 and not overwrite and not (extract and is_zip):
-        return ('skipped', str(dest))
+    params = {'url': url, 'product_id': item.get('sourceId') or item.get('id'), 'extract': extract}
+    if not overwrite:
+        hit = cache_get('3dep-product', params)
+        if hit:
+            return ('cached', str(hit['outputs'][0]))
     part = dest.with_name(dest.name + '.part')
     try:
-        if not dest.is_file() or overwrite:
+        if not overwrite and is_valid_file(dest):
+            print(f'Existing validated archive: {dest.name}', flush=True)
+        else:
             part.unlink(missing_ok=True)
             with session_with_retries() as session:
                 with session.get(url, stream=True, timeout=(30, 180)) as response:
@@ -154,7 +160,6 @@ def download_one(job, out, overwrite=False, extract=False):
                         raise IOError(f'Incomplete download: {dest.name}')
             part.replace(dest)
         if extract and is_zip:
-            # Extract to a temporary directory and publish only when successful.
             temp_dir = out / (dest.stem + '.extracting')
             if temp_dir.exists():
                 shutil.rmtree(temp_dir)
@@ -172,14 +177,17 @@ def download_one(job, out, overwrite=False, extract=False):
                             raise ValueError(f'Symlink in ZIP: {member.filename}')
                     archive.extractall(temp_dir)
                 if extracted.exists():
-                    if not overwrite:
-                        raise FileExistsError(f'Existing extraction directory: {extracted}')
                     shutil.rmtree(extracted)
                 temp_dir.rename(extracted)
             finally:
                 if temp_dir.exists():
                     shutil.rmtree(temp_dir)
+            files = sorted(x for x in extracted.rglob('*') if x.is_file())
+            if not files:
+                raise ValueError(f'Empty extraction: {dest.name}')
+            cache_put('3dep-product', params, files)
             return ('extracted', str(extracted))
+        cache_put('3dep-product', params, [dest])
         return ('downloaded', str(dest))
     finally:
         part.unlink(missing_ok=True)

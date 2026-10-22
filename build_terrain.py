@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from collections import defaultdict
 from rail_elevation_inference import infer_profiles, save_profiles, DEFAULTS
+from crossing_deck_groups import group_crossings, save_groups, append_group_decks
 from pathlib import Path
 
 from tqdm.auto import tqdm
@@ -35,84 +36,218 @@ from shapely.geometry import shape
 
 
 
-def resolve_raster_input(value, kind, output, target_crs=None, refresh=False):
-    """Accept one TIFF or a folder of TIFFs; build a disk-backed mosaic if needed.
+def _project_dem_bounds(boundary_path, target_crs, padding):
+    from rasterio.warp import transform_bounds
+    data = json.loads(Path(boundary_path).read_text(encoding='utf-8-sig'))
+    if data.get('type') == 'FeatureCollection':
+        feats = data.get('features', [])
+        if len(feats) != 1:
+            raise ValueError('Boundary must contain one polygon feature')
+        data = feats[0]['geometry']
+    elif data.get('type') == 'Feature':
+        data = data['geometry']
+    if data.get('type') != 'Polygon':
+        raise ValueError('Boundary must be a WGS84 Polygon')
+    ring = data['coordinates'][0]
+    west, east = min(p[0] for p in ring), max(p[0] for p in ring)
+    south, north = min(p[1] for p in ring), max(p[1] for p in ring)
+    projected = transform_bounds('EPSG:4326', target_crs, west, south, east, north, densify_pts=41)
+    return (projected[0]-padding, projected[1]-padding,
+            projected[2]+padding, projected[3]+padding), (west,south,east,north)
 
-    A folder is searched recursively. The DEM establishes the target CRS;
-    imagery is warped into that CRS so all source tiles align.
+
+def _target_dem_crs(boundary_path, sources):
+    # NAD83 UTM zone appropriate for contiguous US, matching 3DEP source data.
+    # Without a boundary, use the first source CRS as before.
+    if boundary_path:
+        data = json.loads(Path(boundary_path).read_text(encoding='utf-8-sig'))
+        if data.get('type') == 'FeatureCollection':
+            data = data['features'][0]['geometry']
+        elif data.get('type') == 'Feature':
+            data = data['geometry']
+        ring = data['coordinates'][0]
+        lon = (min(p[0] for p in ring)+max(p[0] for p in ring))/2
+        lat = (min(p[1] for p in ring)+max(p[1] for p in ring))/2
+        if not (-180 <= lon <= 180 and 0 <= lat <= 84):
+            raise ValueError('Automatic NAD83 UTM selection requires a northern-hemisphere boundary')
+        zone = max(1, min(60, int((lon + 180)//6) + 1))
+        return rasterio.crs.CRS.from_epsg(26900+zone)
+    with rasterio.open(sources[0]) as ds:
+        return ds.crs
+
+
+def resolve_raster_input(value, kind, output, target_crs=None, refresh=False,
+                         boundary_path=None, boundary_buffer=500.0, vrt_resolution=1.0):
+    """Build a GDAL-readable VRT with Python stdlib + Rasterio; no GDAL CLI.
+
+    Selected source TIFFs must share CRS, pixel dimensions and pixel-grid alignment.
+    The VRT references TIFFs directly; no elevation pixels are copied.
     """
+    import hashlib
+    import xml.etree.ElementTree as ET
+    from rasterio.warp import transform_bounds
+
     path = Path(value).expanduser().resolve()
     if path.is_file():
+        if path.suffix.lower() not in ('.tif', '.tiff', '.vrt'):
+            raise ValueError(f'Unsupported DEM input: {path}')
         return str(path), [str(path)]
     if not path.is_dir():
-        raise FileNotFoundError(f"{kind} input not found: {path}")
-    paths = sorted(p for p in path.rglob('*') if p.is_file() and p.suffix.lower() in ('.tif', '.tiff'))
+        raise FileNotFoundError(f'{kind} input not found: {path}')
+    paths = sorted(p for p in path.rglob('*') if p.is_file() and p.suffix.lower() in ('.tif', '.tiff')
+                   and '_raster_mosaics' not in p.parts)
     if not paths:
-        raise ValueError(f"No TIFFs found in {kind} directory: {path}")
-    print(f"Found {len(paths)} {kind} TIFF(s) in {path}", flush=True)
-    if len(paths) == 1:
-        return str(paths[0]), [str(paths[0])]
-    cache = output / '_raster_mosaics'
-    cache.mkdir(parents=True, exist_ok=True)
-    dst = cache / ('dem_mosaic.tif' if kind == 'DEM' else 'imagery_mosaic.tif')
-    # Avoid accidentally reusing a mosaic from a different source directory.
-    import hashlib
-    fingerprint = hashlib.sha256(('\n'.join(str(x) for x in paths) + '|' + str(target_crs)).encode()).hexdigest()
-    stamp = dst.with_suffix('.sources.json')
-    latest = max(x.stat().st_mtime for x in paths)
-    if (not refresh and dst.exists() and stamp.exists()
-            and dst.stat().st_mtime >= latest):
-        try:
-            if json.loads(stamp.read_text())['fingerprint'] == fingerprint:
-                print(f"Reusing cached {kind} mosaic: {dst}", flush=True)
-                return str(dst), [str(x) for x in paths]
-        except (ValueError, KeyError, OSError):
-            pass
-    temp = dst.with_name(dst.stem + '.partial.tif')
-    temp.unlink(missing_ok=True)
-    with ExitStack() as stack:
-        datasets = [stack.enter_context(rasterio.open(x)) for x in tqdm(paths, desc=f'Opening {kind} TIFFs', unit='file')]
-        if any(ds.crs is None for ds in datasets):
-            raise ValueError(f"Every {kind} TIFF must have a defined CRS")
-        if kind == 'DEM' and len({str(ds.crs) for ds in datasets}) != 1:
-            raise ValueError('DEM tiles must share a CRS; reproject differing DEM tiles before mosaicking')
-        crs = target_crs or datasets[0].crs
-        if kind == 'DEM':
-            sources = datasets
-            indexes = [1]
-            resolution = min(min(abs(ds.res[0]), abs(ds.res[1])) for ds in datasets)
-        else:
-            if any(ds.count < 3 for ds in datasets):
-                raise ValueError('All imagery TIFFs must have at least three bands (RGB)')
-            # Calculate native ground sample distance in target CRS.
-            resolutions = []
-            for ds in datasets:
-                if ds.crs == crs:
-                    resolutions.append(min(abs(ds.res[0]), abs(ds.res[1])))
-                else:
-                    _, _, w, h = calculate_default_transform(ds.crs, crs, ds.width, ds.height, *ds.bounds)
-                    from rasterio.warp import transform_bounds
-                    bb = transform_bounds(ds.crs, crs, *ds.bounds)
-                    resolutions.append(min((bb[2]-bb[0])/w, (bb[3]-bb[1])/h))
-            resolution = min(resolutions)
-            sources = [stack.enter_context(WarpedVRT(ds, crs=crs, resampling=Resampling.bilinear))
-                       if ds.crs != crs else ds for ds in datasets]
-            indexes = [1, 2, 3]
-        # Disk-backed rasterio merge avoids allocating the full mosaic in RAM.
-        print(f"Building {kind} mosaic at approximately {resolution:.3f} units/pixel in {crs}", flush=True)
-        try:
-            merge(sources, res=resolution, indexes=indexes, method='first',
-                  resampling=Resampling.nearest if kind == 'DEM' else Resampling.bilinear,
-                  mem_limit=128, dst_path=str(temp),
-                  dst_kwds={'driver': 'GTiff', 'compress': 'deflate', 'BIGTIFF': 'IF_SAFER', 'tiled': True, 'blockxsize': 256, 'blockysize': 256})
-            temp.replace(dst)
-        except Exception:
-            temp.unlink(missing_ok=True)
-            raise
-    stamp.write_text(json.dumps({'fingerprint': fingerprint, 'sources': [str(x) for x in paths]}, indent=2))
-    print(f"Created {kind} mosaic: {dst}", flush=True)
-    return str(dst), [str(x) for x in paths]
+        raise ValueError(f'No DEM TIFFs found: {path}')
+    if kind != 'DEM':
+        raise ValueError('Imagery uses VirtualImagery, not resolve_raster_input')
 
+    # Pick the CRS from an actual tile intersecting the boundary, not an assumed UTM zone.
+    selected = []
+    excluded = []
+    if boundary_path:
+        boundary_data = json.loads(Path(boundary_path).read_text(encoding='utf-8-sig'))
+        if boundary_data.get('type') == 'FeatureCollection':
+            boundary_data = boundary_data['features'][0]['geometry']
+        elif boundary_data.get('type') == 'Feature':
+            boundary_data = boundary_data['geometry']
+        ring = boundary_data['coordinates'][0]
+        bbox_ll = (min(p[0] for p in ring), min(p[1] for p in ring),
+                   max(p[0] for p in ring), max(p[1] for p in ring))
+    else:
+        bbox_ll = None
+
+    for src in tqdm(paths, desc='Checking DEM coverage', unit='file'):
+        with rasterio.open(src) as ds:
+            if ds.crs is None:
+                excluded.append((str(src), 'missing CRS'))
+                continue
+            if bbox_ll is not None:
+                bb = transform_bounds('EPSG:4326', ds.crs, *bbox_ll, densify_pts=41)
+                # buffer in projected units; the CRS is checked below
+                if (ds.bounds.right <= bb[0]-boundary_buffer or
+                    ds.bounds.left >= bb[2]+boundary_buffer or
+                    ds.bounds.top <= bb[1]-boundary_buffer or
+                    ds.bounds.bottom >= bb[3]+boundary_buffer):
+                    excluded.append((str(src), 'outside project'))
+                    continue
+            selected.append(src)
+    if not selected:
+        raise ValueError(f'No DEM tiles overlap boundary {boundary_path}; found {len(paths)} TIFFs')
+
+    with rasterio.open(selected[0]) as first:
+        crs = first.crs
+        transform = first.transform
+        dx, dy = abs(transform.a), abs(transform.e)
+        ref_left, ref_top = transform.c, transform.f
+        dtype = first.dtypes[0]
+        if (not crs.is_projected or 'met' not in (crs.linear_units or '').lower()):
+            raise ValueError(f'DEM must use a projected CRS in meters; got {crs}')
+        if first.count != 1:
+            raise ValueError(f'DEM must be single-band: {selected[0]}')
+        if not transform.is_rectilinear or transform.a <= 0 or transform.e >= 0:
+            raise ValueError(f'DEM must be north-up: {selected[0]}')
+
+    # Different CRSs are intentionally rejected; Rasterio can still read the final VRT.
+    # A simple mosaic VRT cannot resample/warp sources to a common grid.
+    tiles = []
+    for src in selected:
+        with rasterio.open(src) as ds:
+            if ds.crs != crs:
+                raise ValueError(f'DEM CRS mismatch: {src} uses {ds.crs}; expected {crs}. '
+                                 'Reproject the source separately or remove it from the project folder.')
+            t = ds.transform
+            if ds.count != 1 or ds.dtypes[0] != dtype:
+                raise ValueError(f'DEM band count or dtype mismatch: {src}')
+            if not t.is_rectilinear or t.a <= 0 or t.e >= 0:
+                raise ValueError(f'DEM must be north-up: {src}')
+            if abs(t.a-dx) > max(1e-7, dx*1e-6) or abs(t.e+dy) > max(1e-7, dy*1e-6):
+                raise ValueError(f'DEM pixel resolution differs: {src}; expected {dx} x {dy} m')
+            col_offset = (t.c-ref_left)/dx
+            row_offset = (ref_top-t.f)/dy
+            if abs(col_offset-round(col_offset)) > 1e-4 or abs(row_offset-round(row_offset)) > 1e-4:
+                raise ValueError(f'DEM pixel grids are not aligned: {src}; '
+                                 'reproject/resample this TIFF separately before building VRT')
+            tiles.append((src, ds.width, ds.height, t.c, t.f, ds.nodata, ds.block_shapes[0]))
+
+    if bbox_ll is not None:
+        bounds = _project_dem_bounds(boundary_path, crs, boundary_buffer)[0]
+    else:
+        bounds = (min(t[3] for t in tiles), min(t[4]-t[2]*dy for t in tiles),
+                  max(t[3]+t[1]*dx for t in tiles), max(t[4] for t in tiles))
+    col0 = math.floor((bounds[0]-ref_left)/dx)
+    col1 = math.ceil((bounds[2]-ref_left)/dx)
+    row0 = math.floor((ref_top-bounds[3])/dy)
+    row1 = math.ceil((ref_top-bounds[1])/dy)
+    width, height = col1-col0, row1-row0
+    if width <= 0 or height <= 0:
+        raise ValueError('Invalid DEM VRT extent')
+    origin_x, origin_y = ref_left+col0*dx, ref_top-row0*dy
+    print(f'DEM preflight: {len(paths)} TIFFs found, {len(selected)} selected, '
+          f'{len(excluded)} excluded; CRS {crs}; resolution {dx:g} x {dy:g} m', flush=True)
+
+    cache_dir = output / '_raster_mosaics'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dst = cache_dir / 'dem_mosaic.vrt'
+    stamp = cache_dir / 'dem_mosaic.vrt.sources.json'
+    metadata = [(str(p.resolve()), p.stat().st_size, p.stat().st_mtime_ns) for p in selected]
+    fp = hashlib.sha256(json.dumps({'sources':metadata, 'crs':str(crs), 'bounds':bounds,
+                                    'grid':[origin_x,origin_y,dx,dy,width,height]},
+                                   sort_keys=True).encode()).hexdigest()
+    if not refresh and dst.is_file() and stamp.is_file():
+        try:
+            if json.loads(stamp.read_text(encoding='utf-8'))['fingerprint'] == fp:
+                with rasterio.open(dst) as check:
+                    if check.crs == crs and check.count == 1 and check.width == width and check.height == height:
+                        print(f'Reusing virtual DEM: {dst}', flush=True)
+                        return str(dst), [str(x) for x in selected]
+        except (OSError, ValueError, KeyError, rasterio.errors.RasterioError):
+            pass
+
+    vrt_dtype = {'uint8':'Byte','int8':'Int8','uint16':'UInt16','int16':'Int16',
+                 'uint32':'UInt32','int32':'Int32','float32':'Float32','float64':'Float64',
+                 'uint64':'UInt64','int64':'Int64'}.get(dtype)
+    if not vrt_dtype:
+        raise ValueError(f'Unsupported DEM data type for VRT: {dtype}')
+    root = ET.Element('VRTDataset', rasterXSize=str(width), rasterYSize=str(height))
+    ET.SubElement(root, 'SRS').text = crs.to_wkt()
+    ET.SubElement(root, 'GeoTransform').text = f'{origin_x}, {dx}, 0, {origin_y}, 0, {-dy}'
+    band = ET.SubElement(root, 'VRTRasterBand', dataType=vrt_dtype, band='1')
+    ET.SubElement(band, 'NoDataValue').text = '-9999'
+    # Later sources are placed first in the VRT, so the first sorted TIFF takes precedence
+    # on overlap (GDAL's last SimpleSource normally wins).
+    for src, sw, sh, sx, sy, nodata, block_shape in reversed(tiles):
+        tile_col = round((sx-origin_x)/dx)
+        tile_row = round((origin_y-sy)/dy)
+        dest_x0, dest_y0 = max(0,tile_col), max(0,tile_row)
+        dest_x1, dest_y1 = min(width,tile_col+sw), min(height,tile_row+sh)
+        if dest_x1 <= dest_x0 or dest_y1 <= dest_y0:
+            continue
+        source = ET.SubElement(band, 'ComplexSource' if nodata is not None else 'SimpleSource')
+        ET.SubElement(source, 'SourceFilename', relativeToVRT='0').text = str(src.resolve())
+        ET.SubElement(source, 'SourceBand').text = '1'
+        ET.SubElement(source, 'SourceProperties', RasterXSize=str(sw), RasterYSize=str(sh),
+                      DataType=vrt_dtype, BlockXSize=str(block_shape[1]), BlockYSize=str(block_shape[0]))
+        ET.SubElement(source, 'SrcRect', xOff=str(dest_x0-tile_col), yOff=str(dest_y0-tile_row),
+                      xSize=str(dest_x1-dest_x0), ySize=str(dest_y1-dest_y0))
+        ET.SubElement(source, 'DstRect', xOff=str(dest_x0), yOff=str(dest_y0),
+                      xSize=str(dest_x1-dest_x0), ySize=str(dest_y1-dest_y0))
+        if nodata is not None:
+            ET.SubElement(source, 'NODATA').text = str(nodata)
+    tmp = cache_dir / 'dem_mosaic.partial.vrt'
+    ET.ElementTree(root).write(tmp, encoding='utf-8', xml_declaration=True)
+    try:
+        with rasterio.open(tmp) as check:
+            if check.crs != crs or check.count != 1 or check.width != width or check.height != height:
+                raise ValueError('Generated DEM VRT failed metadata validation')
+            check.read(1, window=((0,1),(0,1)))
+        tmp.replace(dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    stamp.write_text(json.dumps({'fingerprint':fp,'sources':[str(x) for x in selected],
+                                 'excluded':excluded,'crs':str(crs),'bounds':bounds,
+                                 'resolution_m':[dx,dy]},indent=2),encoding='utf-8')
+    print(f'Created DEM VRT without gdalwarp: {dst}', flush=True)
+    return str(dst), [str(x) for x in selected]
 
 
 class VirtualImagery:
@@ -886,7 +1021,7 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
                           faces, step, base, corridor, resolution, tile_pixels,
                           workers=1, clip_batch_size=4000, texture_scale=1.0, output_format="obj",
                           bridges=None, rail_bridge_width=6.0, road_bridge_width=12.0,
-                          inferred_bridges=None, mask_inferred_ground=False):
+                          inferred_bridges=None, mask_inferred_ground=False, grouped_decks=None):
     """Clip faces in batches; avoid intersections for interior faces; parallel on request."""
     from shapely import to_wkb
     b=bounds
@@ -920,12 +1055,15 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
     glb = StreamingGLB(out/'terrain.glb') if is_glb else None
     # Spatially index inferred spans for masking duplicate aerial road/rail imagery.
     mask_shapes = []
-    if mask_inferred_ground and inferred_bridges:
+    if mask_inferred_ground and (grouped_decks or inferred_bridges):
         from shapely.strtree import STRtree
-        for crossing in inferred_bridges:
-            coords = [(p[0],p[1]) for p in crossing['profile_xyz']]
-            if len(coords) >= 2:
-                mask_shapes.append(LineString(coords).buffer(rail_bridge_width/2))
+        if grouped_decks:
+            mask_shapes.extend(g['footprint'] for g in grouped_decks)
+        else:
+            for crossing in inferred_bridges:
+                coords = [(p[0],p[1]) for p in crossing['profile_xyz']]
+                if len(coords) >= 2:
+                    mask_shapes.append(LineString(coords).buffer(rail_bridge_width/2))
         mask_tree = STRtree(mask_shapes) if mask_shapes else None
     else:
         mask_tree = None
@@ -993,10 +1131,14 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
                         vertex_index+=3
                 if is_glb:
                     glb.add_tile(mat, tile_vertices, tile_uv, Image.fromarray(rgb))
-            if is_glb and (bridges or inferred_bridges):
-                n=append_bridge_decks(glb,(bridges or [])+(inferred_bridges or []),imagery,b,base,
+            if is_glb and bridges:
+                n=append_bridge_decks(glb,bridges,imagery,b,base,
                        resolution/texture_scale,rail_bridge_width,road_bridge_width)
-                print(f'Added {n} estimated bridge decks to GLB',flush=True)
+                print(f'Added {n} OSM-tagged bridge decks to GLB',flush=True)
+            if is_glb and grouped_decks:
+                n=append_group_decks(glb,grouped_decks,imagery,b,base,
+                                     resolution/texture_scale)
+                print(f'Added {n} grouped inferred crossing decks to GLB',flush=True)
         if is_glb:
             glb.finish()
         else:
@@ -1051,9 +1193,12 @@ def resolve_infrastructure_path(explicit_path, network_path, output_path):
 def main():
     p = argparse.ArgumentParser(description='Adaptive textured terrain OBJ refined around GeoPackage roads/railways')
     p.add_argument('--format', choices=['obj', 'glb'], default='obj', help='Terrain output format; GLB embeds textures')
+    p.add_argument('--boundary', help='WGS84 project polygon used to filter DEM sources and select target CRS')
+    p.add_argument('--dem-vrt-buffer', type=float, default=500, help='DEM extent padding around project bounds, meters')
+    p.add_argument('--dem-vrt-resolution', type=float, default=1, help='Virtual DEM target resolution in meters')
     p.add_argument('--dem', required=True, help='DEM GeoTIFF or folder of DEM TIFFs')
     p.add_argument('--imagery', help='Imagery GeoTIFF or folder of imagery TIFFs (not required with --network-only)')
-    p.add_argument('--rebuild-mosaics', action='store_true', help='Force recreation of cached DEM mosaic (imagery is virtual)')
+    p.add_argument('--rebuild-mosaics', action='store_true', help='Rebuild the DEM VRT index (imagery is virtual)')
     p.add_argument('--gpkg', help='GPKG, raw Overpass OSM JSON, GeoJSON, or KML input (legacy flag)')
     p.add_argument('--network', help='Network vector file: .gpkg, .json, .geojson, or .kml')
     p.add_argument('--infrastructure', help='Raw infrastructure_raw_osm.json from bridge-aware Overpass query')
@@ -1061,6 +1206,10 @@ def main():
     p.add_argument('--infer-rail-crossings', action='store_true', help='Infer railway bridge spans from DEM grade anomalies and export shared Z profiles')
     p.add_argument('--mask-inferred-ground', action='store_true', help='Darken imagery under inferred rail bridge decks')
     p.add_argument('--rail-sample-spacing', type=float, default=5.0)
+    p.add_argument('--rail-boundary-spacing', type=float, default=0.5, help='Horizontal sampling interval around suspected DEM drops (m)')
+    p.add_argument('--rail-boundary-search', type=float, default=30.0, help='Distance to inspect around detected anomalies (m)')
+    p.add_argument('--deck-group-gap', type=float, default=5.0, help='Merge compatible deck footprints separated by up to this distance (m)')
+    p.add_argument('--deck-group-z-tolerance', type=float, default=1.0, help='Maximum vertical separation for grouping crossing decks (m)')
     p.add_argument('--rail-max-grade', type=float, default=0.03, help='Fraction: 0.03 = 3 percent')
     p.add_argument('--rail-min-span', type=float, default=10.0)
     p.add_argument('--rail-max-span', type=float, default=150.0)
@@ -1102,7 +1251,7 @@ def main():
         p.error('Provide --network or --gpkg')
     if (args.bridges or args.infer_rail_crossings) and (not args.corridor_only or args.format != 'glb'):
         p.error('--bridges currently requires --corridor-only --format glb')
-    if min(args.bridge_approach_m,args.rail_bridge_width,args.road_bridge_width,args.rail_sample_spacing,args.rail_min_span,args.rail_max_span)<=0 or args.rail_min_span >= args.rail_max_span or args.rail_min_dem_drop <= 0 or args.rail_max_grade <= 0:
+    if min(args.bridge_approach_m,args.rail_bridge_width,args.road_bridge_width,args.rail_sample_spacing,args.rail_boundary_spacing,args.rail_min_span,args.rail_max_span)<=0 or args.rail_min_span >= args.rail_max_span or args.rail_min_dem_drop <= 0 or args.rail_max_grade <= 0:
         p.error('Bridge approach distance and widths must be positive')
     if not args.network_only and not args.imagery:
         p.error('--imagery is required unless --network-only is specified')
@@ -1122,7 +1271,10 @@ def main():
     # Resolve before expensive DEM sampling and mesh generation.
     infrastructure = (resolve_infrastructure_path(args.infrastructure, vector_path, out)
                       if args.bridges and not args.network_only else None)
-    dem_path, dem_sources = resolve_raster_input(args.dem, 'DEM', out, refresh=args.rebuild_mosaics)
+    if args.dem_vrt_buffer < 0 or args.dem_vrt_resolution <= 0:
+        p.error('Invalid DEM VRT buffer or resolution')
+    dem_path, dem_sources = resolve_raster_input(args.dem, 'DEM', out, refresh=args.rebuild_mosaics,
+        boundary_path=args.boundary, boundary_buffer=args.dem_vrt_buffer, vrt_resolution=args.dem_vrt_resolution)
     with rasterio.open(dem_path) as dem:
         imagery_path = None
         imagery_sources = []
@@ -1181,6 +1333,7 @@ def main():
             print(f'Corridor area: {corridor.area / 1e6:.3f} km2', flush=True)
         inferred = None
         inferred_decks = []
+        grouped_decks = []
         if args.infer_rail_crossings:
             cfg = {'sample_spacing_m':args.rail_sample_spacing,
                    'grade_limit':args.rail_max_grade,
@@ -1188,7 +1341,9 @@ def main():
                    'max_span_m':args.rail_max_span,
                    'min_depth_m':args.rail_min_dem_drop,
                    'sag_change_pct_per_100ft':args.rail_sag_change_per_100ft,
-                   'crest_change_pct_per_100ft':args.rail_crest_change_per_100ft}
+                   'crest_change_pct_per_100ft':args.rail_crest_change_per_100ft,
+                   'boundary_search_m':args.rail_boundary_search,
+                   'boundary_spacing_m':args.rail_boundary_spacing}
             print('Inferring railway crossings from DEM profiles...',flush=True)
             inferred = infer_profiles(vector_path,dem,cfg)
             save_profiles(out,inferred)
@@ -1217,25 +1372,42 @@ def main():
             bridge_records=bridge_profiles(infrastructure,dem,corridor,args.bridge_approach_m,
                                            args.bridge_review_clearance)
             save_bridge_profiles(out,bridge_records,dem.crs)
-            if inferred_decks:
-                tagged_lines = [LineString([(p[0],p[1]) for p in r['profile_xyz']])
-                                for r in bridge_records if r['type']=='railway' and len(r['profile_xyz'])>=2]
-                if tagged_lines:
-                    kept=[]
-                    for candidate in inferred_decks:
-                        line=LineString([(p[0],p[1]) for p in candidate['profile_xyz']])
-                        overlap=sum(line.intersection(t.buffer(1.0)).length for t in tagged_lines)
-                        if overlap < 0.3*line.length:
-                            kept.append(candidate)
-                    print(f'Removed {len(inferred_decks)-len(kept)} inferred spans overlapping tagged railway bridges')
-                    inferred_decks=kept
+            # Keep inferred spans for grouping. Do not discard an entire inferred
+            # span simply because a portion overlaps an OSM-tagged bridge.
             print(f'Bridge candidates: {len(bridge_records)}; review bridge_review.csv',flush=True)
+        if args.infer_rail_crossings:
+            grouped_decks = group_crossings(inferred_decks, width=args.rail_bridge_width,
+                                            gap=args.deck_group_gap,
+                                            vertical_tolerance=args.deck_group_z_tolerance)
+            save_groups(out, grouped_decks, dem.crs)
+            print(f'Grouped {len(inferred_decks)} inferred spans into {len(grouped_decks)} deck surfaces', flush=True)
+        if bridge_records and grouped_decks:
+            # Suppress duplicate OSM-tagged RAIL bridge surfaces where the
+            # grouped inferred deck already covers the same centerline.
+            # Keep road bridges and non-overlapping rail bridges.
+            from shapely.ops import unary_union as _union
+            cover = _union([g['footprint'] for g in grouped_decks])
+            kept_records = []
+            suppressed = 0
+            for record in bridge_records:
+                if record['type'] != 'railway' or len(record.get('profile_xyz', [])) < 2:
+                    kept_records.append(record)
+                    continue
+                center = LineString([(p[0],p[1]) for p in record['profile_xyz']])
+                overlap = center.intersection(cover).length / max(center.length, 1e-9)
+                if overlap >= 0.30:
+                    suppressed += 1
+                else:
+                    kept_records.append(record)
+            bridge_records = kept_records
+            print(f'Suppressed {suppressed} duplicate OSM railway bridge decks; '
+                  f'exporting {len(bridge_records)} remaining tagged decks', flush=True)
         if args.corridor_only:
             stats = export_corridor_tiled(out, dem, imagery_sources, b, keys, elevations, valid, faces,
                                           step, base, corridor, args.texture_resolution,
                                           args.texture_tile_size, args.workers, args.clip_batch_size, args.texture_scale, args.format,
                                           bridge_records, args.rail_bridge_width, args.road_bridge_width,
-                                          inferred_decks, args.mask_inferred_ground)
+                                          inferred_decks, args.mask_inferred_ground, grouped_decks)
             tw = th = 0
         else:
             if args.format == "glb":
