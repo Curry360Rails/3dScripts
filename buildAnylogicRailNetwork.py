@@ -30,7 +30,7 @@ AGENT_NAME = 'Main'
 LEVEL_INDEX = 0
 DRY_RUN = True  # Review topology before setting False.
 EXPECTED_NETWORKS = 4  # Warning only; no artificial connectivity.
-MODEL_UNITS_PER_METER = 0.03
+MODEL_UNITS_PER_METER = 4#.25#.03
 FLIP_Y = True
 NAME_PREFIX = 'osmRail'
 CROP_ENDPOINT_TOLERANCE_M = 0.01
@@ -328,9 +328,9 @@ def main():
     ref=json.loads(TERRAIN_GEOREFERENCE.read_text(encoding='utf-8'))
     ox,oy,base=ref['origin_x'],ref['origin_y'],ref['base_elevation']
     def cv(p):
-        return ((p[0]-ox)*MODEL_UNITS_PER_METER,
-                ((oy-p[1]) if FLIP_Y else (p[1]-oy))*MODEL_UNITS_PER_METER,
-                (p[2]-base)*MODEL_UNITS_PER_METER)
+        return ((p[0]-ox)/MODEL_UNITS_PER_METER,
+                ((oy-p[1]) if FLIP_Y else (p[1]-oy))/MODEL_UNITS_PER_METER,
+                (p[2]-base)/MODEL_UNITS_PER_METER)
     ws=Workspace(TOKEN)
     agent = ws.getModel(MODEL_NAME).getAgent(AGENT_NAME)
     if not (math.isfinite(MODEL_UNITS_PER_METER) and MODEL_UNITS_PER_METER > 0):
@@ -339,7 +339,7 @@ def main():
     meters_per_pixel = 1.0 / MODEL_UNITS_PER_METER
     agent.setScale(meters_per_pixel)
     print(f'Set {AGENT_NAME} scale: 1 meter = {MODEL_UNITS_PER_METER:g} px '
-          f'({meters_per_pixel:.6f} meters/px)', flush=True)
+        f'({meters_per_pixel:.6f} meters/px)', flush=True)
     level = agent.getLevels()[LEVEL_INDEX]
     switches={}
     for n,c in switch_nodes.items():
