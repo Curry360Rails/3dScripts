@@ -45,8 +45,39 @@ def resolve_raster_input(value, kind, output, target_crs=None, refresh=False):
     from contextlib import ExitStack
     with ExitStack() as stack:
         ds=[stack.enter_context(rasterio.open(p)) for p in paths]
-        if any(x.crs is None for x in ds):raise ValueError('DEM CRS missing')
-        if len({str(x.crs) for x in ds})!=1:raise ValueError('Selected DEM tiles have different CRS')
+        # Report the exact source files and CRS values rather than a generic error.
+        # Rasterio CRS objects compare semantically, so equivalent CRS encodings
+        # need not be rejected merely because their WKT strings differ.
+        missing_crs = [str(p) for p, x in zip(paths, ds) if x.crs is None]
+        if missing_crs:
+            details = '\n'.join(f'  - {p}: CRS missing' for p in missing_crs)
+            raise ValueError(
+                f'{kind} CRS missing in {len(missing_crs)} of {len(paths)} TIFF(s):\n'
+                f'{details}\nAll selected DEM TIFFs must have a defined, matching CRS.'
+            )
+        crs_groups = []
+        for src, x in zip(paths, ds):
+            for group in crs_groups:
+                if x.crs == group['crs']:
+                    group['files'].append(str(src))
+                    break
+            else:
+                crs_groups.append({'crs': x.crs, 'files': [str(src)]})
+        if len(crs_groups) > 1:
+            details = []
+            for group in crs_groups:
+                crs = group['crs']
+                code = crs.to_epsg()
+                label = f'EPSG:{code}' if code is not None else str(crs)
+                details.append(f'  {label} ({len(group["files"])} file(s)):')
+                details.extend(f'    - {p}' for p in group['files'])
+            raise ValueError(
+                f'Selected {kind} TIFFs have {len(crs_groups)} different CRSs '
+                f'across {len(paths)} files under {path}:\n'
+                + '\n'.join(details)
+                + '\nOnly TIFFs with the same CRS can be combined in this VRT. '
+                  'Move unrelated TIFFs out of this project folder or reproject them first.'
+            )
         if any(x.count<1 for x in ds):raise ValueError('DEM has no elevation band')
         if any(abs(x.transform.b)>1e-9 or abs(x.transform.d)>1e-9 for x in ds):raise ValueError('Rotated DEM not supported')
         rx,ry=abs(ds[0].res[0]),abs(ds[0].res[1]);ref=ds[0].transform
