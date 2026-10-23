@@ -15,13 +15,18 @@ class Cache:
     def __init__(self,path):
         self.path=Path(path); self.path.parent.mkdir(parents=True,exist_ok=True)
         with self.connect() as c:
-            c.execute('CREATE TABLE IF NOT EXISTS operations (key TEXT PRIMARY KEY, signature TEXT, outputs TEXT, finished REAL)')
+            # Keep legacy tables intact; use a stable, versioned schema for this pipeline.
+            c.execute('CREATE TABLE IF NOT EXISTS operations_v2 (key TEXT PRIMARY KEY, signature TEXT, outputs TEXT, finished REAL)')
+            old = {r[1] for r in c.execute('PRAGMA table_info(operations)')}
+            if {'key', 'signature', 'outputs', 'finished'} <= old:
+                c.execute('INSERT OR IGNORE INTO operations_v2 (key, signature, outputs, finished) '
+                          'SELECT key, signature, outputs, finished FROM operations')
     def connect(self):
         c=sqlite3.connect(self.path,timeout=60)
         c.execute('PRAGMA journal_mode=WAL');c.execute('PRAGMA busy_timeout=60000')
         return c
     def valid(self,key,signature,outputs):
-        with self.connect() as c: row=c.execute('SELECT signature,outputs FROM operations WHERE key=?',(key,)).fetchone()
+        with self.connect() as c: row=c.execute('SELECT signature,outputs FROM operations_v2 WHERE key=?',(key,)).fetchone()
         if not row or row[0]!=signature:return False
         try:
             recorded=json.loads(row[1]); current=[inventory(p) for p in outputs]
@@ -29,4 +34,4 @@ class Cache:
         except (OSError,ValueError):return False
     def record(self,key,signature,outputs):
         with self.connect() as c:
-            c.execute('INSERT OR REPLACE INTO operations VALUES (?,?,?,?)',(key,signature,json.dumps([inventory(p) for p in outputs]),time.time()))
+            c.execute('INSERT OR REPLACE INTO operations_v2 (key, signature, outputs, finished) VALUES (?,?,?,?)',(key,signature,json.dumps([inventory(p) for p in outputs]),time.time()))
