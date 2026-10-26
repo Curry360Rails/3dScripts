@@ -9,7 +9,6 @@ def test_fingerprint_stable_for_key_order():
     assert fingerprint({'a':1}) != fingerprint({'a':2})
 
 
-@pytest.mark.xfail(strict=True, reason="Cache.valid compares JSON lists against inventory tuples; cache hits never succeed")
 def test_cache_record_reuse_and_invalidation(tmp_path):
     db = Cache(tmp_path/'cache'/'pipeline_cache.sqlite')
     output = tmp_path/'terrain.glb'
@@ -24,7 +23,6 @@ def test_cache_record_reuse_and_invalidation(tmp_path):
     assert not db.valid('terrain','settings-v1',[output])
 
 
-@pytest.mark.xfail(strict=True, reason="Cache.valid compares JSON lists against inventory tuples; cache hits never succeed")
 def test_legacy_five_column_table_does_not_break_cache(tmp_path):
     path=tmp_path/'legacy.sqlite'
     with sqlite3.connect(path) as c:
