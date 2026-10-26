@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-# MAINTAINER NOTES
-# Pipeline orchestration: each stage is optional, but its prerequisites must already exist
-# when skipped. Project-specific paths are derived from the boundary filename. --fresh creates
-# a timestamp-suffixed project directory, so a terrain-only fresh run will not see downloads
-# in the normal project directory. The cache records output inventories; it is not a content-
-# addressed per-file download cache.
-# These comments describe the existing implementation; no executable statements were changed.
-
 """Run the Victorville OSM -> 3DEP/NAIP -> terrain -> GLB -> AnyLogic workflow.
 
 Run `python run_rail_pipeline.py --help`. Each stage is opt-in; use --all for
@@ -26,21 +18,15 @@ from pipeline_cache import Cache, fingerprint, inventory
 
 ROOT = Path(__file__).resolve().parent
 
-# PURPOSE: Run a named subprocess with the pipeline working directory; propagate failures immediately.
-# INPUTS: label, command, cwd.
 def run(label, command, cwd=ROOT):
     print(f'\n=== {label} ===', flush=True)
     print(' '.join(str(x) for x in command), flush=True)
     subprocess.run([str(x) for x in command], cwd=str(cwd), check=True)
 
-# PURPOSE: Fail early when a required single-file input is absent.
-# INPUTS: path, label.
 def check_file(path, label):
     if not Path(path).is_file():
         raise FileNotFoundError(f'{label} missing: {path}')
 
-# PURPOSE: Accept a TIFF path or a recursively populated TIFF directory; reject empty inputs.
-# INPUTS: path, label.
 def check_tifs(path, label):
     path = Path(path)
     if path.is_file() and path.suffix.lower() in ('.tif', '.tiff'):
@@ -49,8 +35,6 @@ def check_tifs(path, label):
         return
     raise FileNotFoundError(f'No {label} TIFFs found under {path}')
 
-# PURPOSE: Extract a west/south/east/north bounding box from a single WGS84 Polygon GeoJSON.
-# INPUTS: path.
 def polygon_bbox(path):
     data = json.loads(Path(path).read_text(encoding='utf-8-sig'))
     if data.get('type') == 'FeatureCollection':
@@ -67,7 +51,6 @@ def polygon_bbox(path):
         raise ValueError('Empty boundary polygon')
     return min(p[0] for p in ring), min(p[1] for p in ring), max(p[0] for p in ring), max(p[1] for p in ring)
 
-# PURPOSE: Parse stage flags, scope all paths by boundary stem, consult stage cache, and execute selected stages.
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--project-name',help='Override boundary filename project name')
@@ -162,11 +145,11 @@ def main():
         stage('Build terrain',cmd,'terrain',[dem_dir,naip_dir,osm_json],
               [out/('terrain.glb' if args.format=='glb' else 'terrain.obj'),out/'georeference.json'],force=args.force_rebuild)
     if 'blender' in selected:
-        if not args.dry_run:check_file(out/'terrain.obj','Terrain OBJ')
+        if not args.dry_run:check_file(out/'terrain.glb','Terrain GLB')
         stage('Blender optimization',[args.blender_exe,'--background','--factory-startup','--python',ROOT/'blender_terrain_to_glb.py','--',
-              '--input',out/'terrain.obj','--output',out/'terrain_optimized.glb','--ratio',args.ratio,
+              '--input',out/'terrain.glb','--output',out/'terrain_optimized.glb','--ratio',args.ratio,
               '--texture-scale',args.texture_scale,'--merge-distance','0.0001'],
-              'blender',[out/'terrain.obj',out/'terrain.mtl',out/'textures'],[out/'terrain_optimized.glb'])
+              'blender',[out/'terrain.glb'],[out/'terrain_optimized.glb'])
     if 'anylogic' in selected:
         rail_script = ROOT / 'buildAnylogicRailNetwork.py'
         if not args.dry_run:
