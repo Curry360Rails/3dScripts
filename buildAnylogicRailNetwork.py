@@ -1,3 +1,10 @@
+# MAINTAINER NOTES
+# AnyLogic design-time importer. OSM topology and model coordinates must be handled
+# separately: original OSM node IDs establish connectivity, projected coordinates establish
+# geometry, and AnyLogic scale controls model presentation units. Verify the scale conversion
+# against the terrain georeference before modifying a live model.
+# These comments describe the existing implementation; no executable statements were changed.
+
 """Build AnyLogic RailTracks directly from Overpass raw OSM JSON and 3DEP GeoTIFFs.
 
 No intermediate rail_lines_3d.geojson or rail_switches_3d.geojson required.
@@ -41,13 +48,22 @@ SKIP_TRACK_NAMES = set()
 PAUSE_AFTER_CREATE = False
 PAUSE_AFTER_POINTS = False
 
+# PURPOSE: Disjoint-set structure for connected-component identification in railway topology.
 class DSU:
+    # PURPOSE: Initialize one disjoint-set representative per item.
+    # INPUTS: n.
     def __init__(self,n):self.p=list(range(n))
+    # PURPOSE: Return the representative of an item, compressing parent paths.
+    # INPUTS: i.
     def find(self,i):
         while self.p[i]!=i:self.p[i]=self.p[self.p[i]];i=self.p[i]
         return i
+    # PURPOSE: Join the components containing two items.
+    # INPUTS: a, b.
     def union(self,a,b):self.p[self.find(a)]=self.find(b)
 
+# PURPOSE: Remove near-duplicate vertices while keeping rail endpoint and node-ID semantics.
+# INPUTS: points, ids, tolerance.
 def clean_points(points, ids=None, tolerance=MIN_VERTEX_SPACING_M):
     """Collapse consecutive sub-tolerance points, preferring tagged OSM nodes.
 
@@ -81,6 +97,8 @@ def clean_points(points, ids=None, tolerance=MIN_VERTEX_SPACING_M):
     return [p for p, _ in kept], [nid for _, nid in kept]
 
 
+# PURPOSE: Reject degenerate railway line geometry before AnyLogic markup creation.
+# INPUTS: points.
 def validate_polyline(points):
     if len(points) < 2:
         return "fewer than two points"
@@ -94,6 +112,7 @@ def validate_polyline(points):
     return None
 
 
+# PURPOSE: Read railway ways and nodes from the downloaded OSM data.
 def load_osm_features():
     """Read OSM ways and tagged switches, preserving each way's node IDs."""
     import rasterio
@@ -149,6 +168,8 @@ def load_osm_features():
     return features, switch_ids
 
 
+# PURPOSE: Sample DEM elevations for projected railway coordinates.
+# INPUTS: projected, crs.
 def sample_dem(projected, crs):
     """Sample original 3DEP TIFFs or cached mosaic, once per OSM node ID.
 
@@ -192,6 +213,7 @@ def sample_dem(projected, crs):
     return values
 
 
+# PURPOSE: Split railway ways at shared nodes, merge valid chains and derive railway switches/networks.
 def build():
     features, switch_ids = load_osm_features()
     # Split at shared original OSM nodes and explicitly tagged switches.
@@ -316,6 +338,7 @@ def build():
         print(f'WARNING: expected {EXPECTED_NETWORKS}; no artificial connections added.')
     return merged,switch_nodes
 
+# PURPOSE: Convert the prepared topology to AnyLogic design-time markup with model-space scaling.
 def main():
     merged,switch_nodes=build()
     if DRY_RUN:

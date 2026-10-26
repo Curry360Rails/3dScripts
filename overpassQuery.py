@@ -1,3 +1,8 @@
+# MAINTAINER NOTES
+# Overpass OSM acquisition. GeoJSON coordinate pairs are longitude/latitude; Overpass polygon
+# syntax uses latitude/longitude. API availability and OSM feature completeness vary by area.
+# These comments describe the existing implementation; no executable statements were changed.
+
 import requests
 import json
 from pathlib import Path
@@ -6,6 +11,8 @@ from xml.etree import ElementTree as ET
 # The project boundary is shared with the 3DEP and NAIP download stages.
 import argparse
 
+# PURPOSE: Load boundary geometry and convert coordinate pairs into Overpass polygon query syntax.
+# INPUTS: path.
 def load_polygon(path):
     data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     if data.get("type") == "FeatureCollection":
@@ -119,6 +126,8 @@ geojson = {"type": "FeatureCollection", "features": features}
 # KML requires lon,lat ordering. OSM data has no surveyed Z values.
 namespace = "http://www.opengis.net/kml/2.2"
 ET.register_namespace("", namespace)
+# PURPOSE: Helper for retrieving or formatting an OSM element tag.
+# INPUTS: name.
 def tag(name):
     return f"{{{namespace}}}{name}"
 

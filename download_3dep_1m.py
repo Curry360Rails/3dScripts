@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# MAINTAINER NOTES
+# USGS 3DEP acquisition through The National Map. Search metadata describes candidate
+# products; downloaded archives or TIFFs are separate artifacts. Polygon/date filtering should
+# be reviewed before bulk downloads.
+# These comments describe the existing implementation; no executable statements were changed.
+
 """Search and download original USGS 3DEP 1-meter DEM products using TNM Access API.
 
 Coordinates are WGS84 longitude,latitude decimal degrees. Searches product footprints
@@ -22,6 +28,8 @@ API = 'https://tnmaccess.nationalmap.gov/api/v1/products'
 DATASET = 'Digital Elevation Model (DEM) 1 meter'
 
 
+# PURPOSE: Read the requested polygon and derive the geographic search geometry for TNM queries.
+# INPUTS: args.
 def parse_polygon(args):
     if args.geojson:
         data = json.loads(Path(args.geojson).read_text(encoding='utf-8'))
@@ -52,6 +60,7 @@ def parse_polygon(args):
     return pts
 
 
+# PURPOSE: Configure a requests session with HTTP retry behavior for transient server failures.
 def session_with_retries():
     s = requests.Session()
     s.headers['User-Agent'] = '3DEPPolygonDownloader/1.0 (Python requests; USGS TNM Access)'
@@ -60,6 +69,8 @@ def session_with_retries():
     return s
 
 
+# PURPOSE: Query and paginate National Map product metadata matching the geographic/date filters.
+# INPUTS: s, pts, args.
 def get_products(s, pts, args):
     # TNM API accepts a polygon with 3 to 23 lon/lat coordinate pairs.
     # Larger polygons are queried using their bbox, then optionally filtered
@@ -115,6 +126,8 @@ def get_products(s, pts, args):
     return list(unique.values())
 
 
+# PURPOSE: Turn a product-derived name into a filesystem-safe download basename.
+# INPUTS: url, item, index.
 def safe_name(url, item, index):
     name = Path(unquote(urlparse(url).path)).name
     if not name or '.' not in name:
@@ -122,6 +135,8 @@ def safe_name(url, item, index):
     return name
 
 
+# PURPOSE: Stream a remote product to disk rather than buffering the complete archive in memory.
+# INPUTS: s, item, out, index, overwrite.
 def download(s, item, out, index, overwrite=False):
     url = item['downloadURL']
     dest = out / safe_name(url, item, index)
@@ -144,6 +159,8 @@ def download(s, item, out, index, overwrite=False):
     return dest
 
 
+# PURPOSE: Extract a downloaded ZIP archive into the configured destination.
+# INPUTS: path, out.
 def extract_zip(path, out):
     if not zipfile.is_zipfile(path):
         return
@@ -160,6 +177,7 @@ def extract_zip(path, out):
     print(f'Extracted {path.name}: {len(tifs)} TIFF files (other product files may also be present)')
 
 
+# PURPOSE: Coordinate TNM discovery, product selection, downloads, extraction and metadata output.
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     source = p.add_mutually_exclusive_group(required=True)

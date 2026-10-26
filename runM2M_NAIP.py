@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# MAINTAINER NOTES
+# NAIP acquisition via USGS M2M. Scene discovery, newest-per-sector selection, download URL
+# retrieval, and archive extraction are separate operations. Credentials are required for
+# authenticated API requests. Search freshness and downloaded-product reuse are different
+# concerns.
+# These comments describe the existing implementation; no executable statements were changed.
+
 """USGS M2M NAIP: paginate scenes, select newest downloadable scene per tile, download concurrently.
 
 Set USGS_M2M_USERNAME and USGS_M2M_TOKEN environment variables.
@@ -22,6 +29,8 @@ API = 'https://m2m.cr.usgs.gov/api/api/json/stable/'
 ID_PATTERN = re.compile(r'^(.*)_(\d{8})$')
 
 
+# PURPOSE: Send one authenticated USGS M2M API request and interpret its response.
+# INPUTS: session, endpoint, payload, retries.
 def call(session, endpoint, payload, retries=3):
     for attempt in range(retries):
         try:
@@ -42,6 +51,8 @@ def call(session, endpoint, payload, retries=3):
             time.sleep(min(15, 2 ** attempt))
 
 
+# PURPOSE: Extract an acquisition date for sorting imagery scenes.
+# INPUTS: scene.
 def scene_date(scene):
     name = str(scene.get('entityId', ''))
     match = ID_PATTERN.match(name)
@@ -59,6 +70,8 @@ def scene_date(scene):
     return dt.date.min
 
 
+# PURPOSE: Derive a stable spatial tile/sector key used to choose the latest scene.
+# INPUTS: scene.
 def tile_key(scene):
     name = str(scene.get('entityId', ''))
     match = ID_PATTERN.match(name)
@@ -68,6 +81,8 @@ def tile_key(scene):
     return name
 
 
+# PURPOSE: Page through matching scenes rather than relying on the first API response.
+# INPUTS: session, dataset, spatial_filter, start, end, page_size.
 def search_all(session, dataset, spatial_filter, start, end, page_size):
     results = []
     offset = 1
@@ -101,6 +116,8 @@ def search_all(session, dataset, spatial_filter, start, end, page_size):
     return results
 
 
+# PURPOSE: Inspect available downloadable product options for a scene.
+# INPUTS: session, dataset, ids, batch_size.
 def download_options(session, dataset, ids, batch_size=500):
     result = {}
     for i in range(0, len(ids), batch_size):
@@ -113,6 +130,8 @@ def download_options(session, dataset, ids, batch_size=500):
     return result
 
 
+# PURPOSE: Select the preferred latest scene for each spatial sector.
+# INPUTS: scenes, options.
 def choose_scenes(scenes, options):
     groups = {}
     for scene in scenes:
@@ -137,6 +156,8 @@ def choose_scenes(scenes, options):
     return selected, unavailable
 
 
+# PURPOSE: Resolve scene selections to downloadable URLs through the M2M workflow.
+# INPUTS: session, dataset, selected, poll_seconds, poll_attempts, request_batch.
 def gather_urls(session, dataset, selected, poll_seconds, poll_attempts, request_batch):
     downloads = [{'entityId': scene['entityId'], 'productId': option['id']} for scene, option in selected]
     urls = {}
@@ -165,6 +186,8 @@ def gather_urls(session, dataset, selected, poll_seconds, poll_attempts, request
     return list(dict.fromkeys(urls.values()))
 
 
+# PURPOSE: Choose a safe output filename using response metadata.
+# INPUTS: response, url, number.
 def filename_from_response(response, url, number):
     disposition = response.headers.get('Content-Disposition', '')
     match = re.search(r'filename\*?=(?:UTF-8\'\')?["\']?([^"\';]+)', disposition, re.I)
@@ -176,6 +199,8 @@ def filename_from_response(response, url, number):
     return name if name and name not in ('.', '/') else f'naip_download_{number}.zip'
 
 
+# PURPOSE: Extract ZIP contents and remove the archive after successful extraction.
+# INPUTS: archive.
 def extract_and_remove_zip(archive):
     """Extract into a folder named after the archive; delete ZIP only on success."""
     archive = Path(archive)
@@ -213,6 +238,8 @@ def extract_and_remove_zip(archive):
         raise
 
 
+# PURPOSE: Download and verify one scene archive or file; called by concurrent workers.
+# INPUTS: job, output, overwrite, extract_zips.
 def download_one(job, output, overwrite, extract_zips=True):
     number, url = job
     for attempt in range(3):
@@ -245,6 +272,7 @@ def download_one(job, output, overwrite, extract_zips=True):
             time.sleep(2 ** attempt)
 
 
+# PURPOSE: Parse M2M credentials, dates and bounds, then search, select and download imagery.
 def main():
     p = argparse.ArgumentParser(description='Download latest available NAIP image for each geographic tile.')
     p.add_argument('--username', default=os.getenv('USGS_M2M_USERNAME'))

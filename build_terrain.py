@@ -1,3 +1,11 @@
+# MAINTAINER NOTES
+# Terrain generation stages: DEM source resolution, virtual imagery, railway/corridor vector
+# loading, adaptive cell refinement, DEM elevation sampling, clipping to corridor, then
+# textured OBJ/GLB export. Projected XY units are meters. The exported vertex Z is relative to
+# base elevation; retain georeference metadata when importing into another engine. VRT inputs
+# still require their source TIFFs.
+# These comments describe the existing implementation; no executable statements were changed.
+
 """Adaptive, crack-free terrain mesh from a DEM and GeoPackage corridor lines."""
 import argparse
 import bisect
@@ -31,6 +39,8 @@ from shapely.geometry import shape
 
 
 
+# PURPOSE: Resolve a DEM file or directory into a single readable raster source; validate tile compatibility.
+# INPUTS: value, kind, output, target_crs, refresh.
 def resolve_raster_input(value, kind, output, target_crs=None, refresh=False):
     """Virtual DEM mosaic: original source TIFFs remain untouched."""
     from xml.etree import ElementTree as ET
@@ -116,6 +126,7 @@ def resolve_raster_input(value, kind, output, target_crs=None, refresh=False):
     return str(dst),list(map(str,paths))
 
 
+# PURPOSE: Read multiple orthophoto rasters as one virtual imagery source without a physical mosaic.
 class VirtualImagery:
     """On-demand virtual mosaic: source TIFFs stay untouched on disk.
 
@@ -123,6 +134,8 @@ class VirtualImagery:
     Only source footprints intersecting a requested output window are read.
     First source with valid data wins, matching the old merge(method='first').
     """
+    # PURPOSE: Open and prepare source rasters for on-demand texture rendering.
+    # INPUTS: sources, target_crs.
     def __init__(self, sources, target_crs):
         from rasterio.warp import transform_bounds
         self.sources = [str(Path(p).resolve()) for p in sources]
@@ -144,15 +157,21 @@ class VirtualImagery:
             self.stack.close()
             raise
 
+    # PURPOSE: Release opened raster datasets and associated resources.
     def close(self):
         self.stack.close()
 
+    # PURPOSE: Enter the imagery context manager.
     def __enter__(self):
         return self
 
+    # PURPOSE: Close imagery resources on context exit, including exceptions.
+    # INPUTS: exc_type, exc, tb.
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
+    # PURPOSE: Render a requested projected bounding box into an RGB image of specified pixel dimensions.
+    # INPUTS: bounds, width, height.
     def render(self, bounds, width, height):
         from rasterio.windows import from_bounds as window_from_bounds
         from rasterio.windows import Window
@@ -198,6 +217,8 @@ class VirtualImagery:
         return result
 
 
+# PURPOSE: Collect imagery sources and prepare them for virtual per-tile reads.
+# INPUTS: value, target_crs.
 def resolve_imagery_virtual(value, target_crs):
     """Return TIFF paths without ever writing an imagery mosaic."""
     path = Path(value).expanduser().resolve()
@@ -212,6 +233,8 @@ def resolve_imagery_virtual(value, target_crs):
     print(f'Using {len(sources)} source imagery TIFFs via on-demand WarpedVRT (no physical mosaic)', flush=True)
     return [str(p) for p in sources]
 
+# PURPOSE: Read and reproject supported vector network linework from a GIS source.
+# INPUTS: path, layers, target_crs, preserve_original_crs.
 def load_lines(path, layers, target_crs, preserve_original_crs=False):
     import pyogrio
     from pyogrio.raw import read as read_raw
@@ -263,6 +286,8 @@ def load_lines(path, layers, target_crs, preserve_original_crs=False):
 
 
 
+# PURPOSE: Parse network lines from OSM JSON, GeoJSON or KML and transform them to the DEM CRS.
+# INPUTS: path, layers, target_crs, preserve_original_crs.
 def load_vector_lines(path, layers, target_crs, preserve_original_crs=False):
     """Read a single GPKG, Overpass JSON, GeoJSON, or KML vector source.
 
@@ -341,6 +366,8 @@ def load_vector_lines(path, layers, target_crs, preserve_original_crs=False):
     return transformed, [path.name]
 
 
+# PURPOSE: Yield linear pieces from simple or multipart geometries.
+# INPUTS: geom.
 def _line_parts(geom):
     if geom.is_empty:
         return []
@@ -350,6 +377,8 @@ def _line_parts(geom):
         return [line for part in geom.geoms for line in _line_parts(part)]
     return []
 
+# PURPOSE: Export 3D line geometry, preserving XY topology and applying configured Z sampling/offset rules.
+# INPUTS: geometries, dem, out, origin_x, origin_y, base, spacing, z_offset, preserve_z (and additional options).
 def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offset, preserve_z, exact_vertices=False):
     path = out / 'network_lines.obj'
     idx = 1
@@ -389,6 +418,8 @@ def export_lines(geometries, dem, out, origin_x, origin_y, base, spacing, z_offs
 
 
 
+# PURPOSE: Load corridor line geometries for proximity-based terrain refinement.
+# INPUTS: path, layers, target_crs.
 def read_corridors(path, layers, target_crs):
     from shapely.strtree import STRtree
     geometries, selected = load_vector_lines(path, layers, target_crs)
@@ -398,6 +429,8 @@ def read_corridors(path, layers, target_crs):
 # Top-level quadtree tiles are independent; workers share a fixed integer lattice.
 _REFINE = {}
 
+# PURPOSE: Initialize per-process spatial and elevation data for parallel adaptive cell refinement.
+# INPUTS: lines_wkb, bounds, near, middle, far, buffer, transition, corridor_only, corridor_radius (and additional options).
 def _init_refine(lines_wkb, bounds, near, middle, far, buffer, transition,
                  corridor_only, corridor_radius, dem_path, max_error, flat_spacing):
     from shapely import from_wkb
@@ -410,6 +443,8 @@ def _init_refine(lines_wkb, bounds, near, middle, far, buffer, transition,
                    dem_path=dem_path, max_error=max_error, flat_spacing=flat_spacing)
 
 
+# PURPOSE: Recursively refine a spatial cell task according to corridor proximity and optional elevation error.
+# INPUTS: task.
 def _refine_task(task):
     from shapely.geometry import box
     ix_start, ix_end, j, scale, step = task
@@ -468,6 +503,8 @@ def _refine_task(task):
     return cells
 
 
+# PURPOSE: Create adaptive terrain cells and enforce the maximum cell budget.
+# INPUTS: bounds, tree, near, middle, far, buffer, transition, max_cells, corridor_only (and additional options).
 def build_cells(bounds, tree, near, middle, far, buffer, transition, max_cells,
                 corridor_only=False, corridor_radius=100, workers=1,
                 dem_path=None, max_error=None, flat_spacing=20,
@@ -507,6 +544,8 @@ def build_cells(bounds, tree, near, middle, far, buffer, transition, max_cells,
     return cells,step
 
 
+# PURPOSE: Sample terrain vertex elevations in batches to reduce raster I/O overhead.
+# INPUTS: dem, keys, bounds, step, batch_size.
 def sample_dem_blockwise(dem, keys, bounds, step, batch_size=250000):
     # Read each raster block once per batch rather than call dem.sample millions of times.
     from rasterio.windows import Window
@@ -538,6 +577,8 @@ def sample_dem_blockwise(dem, keys, bounds, step, batch_size=250000):
     return elevations
 
 
+# PURPOSE: Deduplicate terrain vertices and build indexed triangle connectivity from cells.
+# INPUTS: cells.
 def mesh_topology(cells):
     horizontal = defaultdict(set)
     vertical = defaultdict(set)
@@ -574,6 +615,8 @@ def mesh_topology(cells):
     return vertices, faces
 
 
+# PURPOSE: Iterate polygonal components after clipping or intersection.
+# INPUTS: geom.
 def polygon_parts(geom):
     if geom.is_empty:
         return
@@ -589,6 +632,8 @@ def polygon_parts(geom):
 _WORK = {}
 
 
+# PURPOSE: Initialize per-worker clipping geometry and tile layout state.
+# INPUTS: xy, valid, corridor_wkb, x0, y0, tile_m, xmax, ymax.
 def _init_clip_worker(xy, valid, corridor_wkb, x0, y0, tile_m, xmax, ymax):
     from shapely import from_wkb, prepare
     corridor = from_wkb(corridor_wkb)
@@ -598,6 +643,8 @@ def _init_clip_worker(xy, valid, corridor_wkb, x0, y0, tile_m, xmax, ymax):
                  x0=x0, y0=y0, tile_m=tile_m, xmax=xmax, ymax=ymax)
 
 
+# PURPOSE: Clip a batch of terrain faces against the corridor and distribute pieces into texture tiles.
+# INPUTS: batch.
 def _clip_batch(batch):
     from shapely.geometry import Polygon, box
     w = _WORK
@@ -637,6 +684,8 @@ def _clip_batch(batch):
     return results
 
 
+# PURPOSE: Export clipped terrain as tiled textured OBJ or GLB, using on-demand imagery reads.
+# INPUTS: out, dem, imagery_sources, bounds, keys, elevations, valid, faces, step (and additional options).
 def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, valid,
                           faces, step, base, corridor, resolution, tile_pixels,
                           workers=1, clip_batch_size=4000, texture_scale=1.0, output_format="glb", texture_cache=None):
@@ -736,6 +785,7 @@ def export_corridor_tiled(out, dem, imagery_sources, bounds, keys, elevations, v
     return {'tiles':len(tile_polygons),'vertices':vertex_index}
 
 
+# PURPOSE: Coordinate raster resolution, vector parsing, mesh generation, texture tiling and export.
 def main():
     p = argparse.ArgumentParser(description='Adaptive textured terrain OBJ refined around GeoPackage roads/railways')
     p.add_argument('--format', choices=['glb','obj'],default='glb')

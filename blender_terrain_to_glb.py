@@ -1,3 +1,8 @@
+# MAINTAINER NOTES
+# Optional Blender post-processing. This stage is separate from direct GLB generation and may
+# change mesh density or image dimensions; use only when its specific optimization is desired.
+# These comments describe the existing implementation; no executable statements were changed.
+
 """Headless textured OBJ -> GLB with optional image resizing and single-atlas bake.
 Blender 4.x/5.x. Run via blender --background --python SCRIPT -- --input ... --output ...
 """
@@ -8,6 +13,7 @@ from pathlib import Path
 import bpy
 
 
+# PURPOSE: Parse Blender-side input, output, decimation and optional texture-processing settings.
 def parse_args():
     argv = sys.argv[sys.argv.index('--') + 1:] if '--' in sys.argv else []
     p = argparse.ArgumentParser()
@@ -27,12 +33,16 @@ def parse_args():
     return p.parse_args(argv)
 
 
+# PURPOSE: Set Blender selection and active object explicitly before mesh operators.
+# INPUTS: obj.
 def select_only(obj):
     bpy.ops.object.select_all(action='DESELECT')
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
 
 
+# PURPOSE: Downsample source texture images and update the materials that reference them.
+# INPUTS: objects, scale, folder.
 def downsample_images(objects, scale, folder):
     if scale == 1.0:
         return
@@ -67,6 +77,8 @@ def downsample_images(objects, scale, folder):
     print(f'Downsampled {len(cache)} unique textures', flush=True)
 
 
+# PURPOSE: Optional atlas baking helper; consult its existing docstring for requirements and limitations.
+# INPUTS: obj, folder, size, margin, samples.
 def bake_atlas(obj, folder, size, margin, samples):
     """Bake existing diffuse colors to a fresh UV atlas on the already decimated mesh."""
     if not obj.data.uv_layers:
@@ -132,6 +144,7 @@ def bake_atlas(obj, folder, size, margin, samples):
     print(f'Baked atlas saved: {atlas_path}', flush=True)
 
 
+# PURPOSE: Load source geometry, perform requested optimization and export the resulting GLB.
 def main():
     a = parse_args()
     if not 0 < a.ratio <= 1 or not 0 < a.texture_scale <= 1:
