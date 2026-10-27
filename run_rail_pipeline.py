@@ -61,8 +61,9 @@ def main():
     p.add_argument('--mesh-mode',choices=['adaptive','flat','full'],default='adaptive')
     p.add_argument('--cache-ttl-days',type=int,default=7)
     p.add_argument('--all', action='store_true', help='Run OSM, DEM, NAIP, terrain and Blender; AnyLogic requires --import-anylogic')
-    for stage in ('osm', 'dem', 'naip', 'terrain', 'blender', 'anylogic'):
+    for stage in ('osm', 'dem', 'naip', 'terrain', 'blender', 'rail-elevations', 'anylogic'):
         p.add_argument('--' + stage, action='store_true', help='Run only this stage (combine flags as desired)')
+    p.add_argument('--resample-rail-dem', action='store_true', help='Force fresh DEM sampling for railway nodes')
     p.add_argument('--import-anylogic', action='store_true', help='Explicitly authorize edits to AnyLogic model (requires --anylogic or --all)')
     p.add_argument('--boundary', default='boundary.geojson', help='Shared WGS84 polygon GeoJSON for OSM, DEM and NAIP')
     p.add_argument('--dem-folder', default='3dep_dem')
@@ -84,7 +85,7 @@ def main():
     p.add_argument('--model-units-per-meter', type=float, default=0.03)
     p.add_argument('--dry-run', action='store_true', help='Print commands, do not execute any stages')
     args = p.parse_args()
-    selected = {name for name in ('osm', 'dem', 'naip', 'terrain', 'blender', 'anylogic') if getattr(args, name)}
+    selected = {name for name in ('osm', 'dem', 'naip', 'terrain', 'blender', 'rail-elevations', 'anylogic') if getattr(args, name)}
     if args.all:
         selected.update(('osm', 'dem', 'naip', 'terrain'))
         if args.format=='obj':selected.add('blender')
@@ -150,6 +151,17 @@ def main():
               '--input',out/'terrain.glb','--output',out/'terrain_optimized.glb','--ratio',args.ratio,
               '--texture-scale',args.texture_scale,'--merge-distance','0.0001'],
               'blender',[out/'terrain.glb'],[out/'terrain_optimized.glb'])
+    if 'rail-elevations' in selected or 'anylogic' in selected:
+        rail_xyz = out / 'railway_nodes_xyz.json'
+        sampler_cmd = [sys.executable, ROOT / 'sample_railway_dem.py',
+                       '--osm', osm_json, '--georeference', out / 'georeference.json',
+                       '--dem-mosaic', out / '_raster_mosaics' / 'dem_mosaic.tif',
+                       '--dem-folder', dem_dir, '--output', rail_xyz]
+        if args.resample_rail_dem:
+            sampler_cmd.append('--force')
+        stage('Sample railway DEM elevations', sampler_cmd, 'rail-elevations',
+              [osm_json, out / 'georeference.json', dem_dir], [rail_xyz],
+              force=args.resample_rail_dem)
     if 'anylogic' in selected:
         rail_script = ROOT / 'buildAnylogicRailNetwork.py'
         if not args.dry_run:
@@ -164,8 +176,7 @@ def main():
             spec.loader.exec_module(module)
             module.DATA_DIR = out
             module.OSM_JSON = osm_json
-            module.DEM_MOSAIC = out / '_raster_mosaics' / 'dem_mosaic.vrt'
-            module.DEM_FOLDER = dem_dir
+            module.RAIL_XYZ_CACHE = out / 'railway_nodes_xyz.json'
             module.TERRAIN_GEOREFERENCE = out / 'georeference.json'
             module.MODEL_NAME = args.model_name
             module.AGENT_NAME = args.agent_name
