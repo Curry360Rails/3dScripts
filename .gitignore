@@ -2,3 +2,7 @@
 naip_downloads/
 osm_output/
 terrain_output/
+*.svg
+__pycache__/
+pipeline_cache/
+*.zip

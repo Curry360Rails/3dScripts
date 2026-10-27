@@ -1,0 +1,48 @@
+flowchart TD
+    B["boundary.geojson"] --> R["run_rail_pipeline.py"]
+    R --> O["overpassQuery.py"]
+    R --> D["3DEP downloader"]
+    R --> N["NAIP downloader"]
+
+    O --> OJ["osm_output/project/
+    railway_raw_osm.json
+    infrastructure_raw_osm.json
+    GeoJSON / KML"]
+    D --> DT["3dep_dem/project/
+    DEM .tif files"]
+    N --> NT["naip_downloads/project/
+    Imagery .tif files"]
+
+    DT --> V["DEM VRT"]
+    NT --> VI["VirtualImagery"]
+
+    OJ --> T["build_terrain.py"]
+    V --> T
+    VI --> T
+
+    T --> TX["texture_cache/
+    corridor textures"]
+    T --> G["terrain_output/project/
+    terrain.glb
+    georeference.json"]
+
+    G --> BL["blender_terrain_to_glb.py"]
+    BL --> GO["terrain_optimized.glb"]
+
+    OJ --> A["buildAnylogicRailNetwork.py"]
+    G --> A
+    A --> AN["AnyLogic
+    RailwayTracks + Switches"]
+
+    R <--> C[("pipeline_cache.sqlite")]
+    C -.-> O
+    C -.-> D
+    C -.-> N
+    C -.-> T
+
+    classDef script fill:#2563eb,color:#fff,stroke:#2563eb
+    classDef output fill:#166534,color:#fff,stroke:#166534
+    classDef data fill:#64748b,color:#fff,stroke:#64748b
+    class O,D,N,T,BL,A,R script
+    class G,GO,AN output
+    class B,OJ,DT,NT,V,VI,TX,C data
